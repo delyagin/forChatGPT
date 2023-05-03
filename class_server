@@ -1,0 +1,456 @@
+from library import mua
+import socketserver
+import socket
+from library import *
+import time
+import os
+import sys
+import threading
+from datetime import datetime
+import re
+import selectors
+import types
+
+CLIENT_TIMEOUT = 3*60
+SERVER_JOB_TIMEOUT = 15*60
+
+class _Functions:
+    def __init__(self, clients_number):
+        self.count = 1
+        self.clients = clients_number
+        self.server_wait_status = ["Client-1 ready", "Client-2 ready", "Client-3 ready", "Client-4 ready",
+                                   "Client-1 done step", "Client-2 done step", "Client-3 done step", "Client-4 done step",
+                                   "Client-1 got the job", "Client-2 got the job", "Client-3 got the job", "Client-4 got the job"]
+        self.server_wait = self.server_wait_status[1]
+        self.client_error = False
+        self.stop_server  = False
+        self.client1_done = False
+        self.client2_done = False
+        self.client3_done = False
+        self.client4_done = False
+        self.client2_can_do_step = True
+        self.client3_can_do_step = False
+        self.client4_can_do_step = False
+        self.data = None
+        self.timers = {}
+        for num in range(self.clients):
+            self.timers["Client-" + str(num+1)] = time.time()
+
+    def del_timer(self, key):
+        # print("Dict: ", self.timers)
+        del self.timers[key]
+        # print("Deleted ", key)
+
+    def update_timer(self, data):
+        # print("Update timer, data: ", data)
+        pattern_n = "(\d)"
+        num = re.search(pattern_n, data)
+        if(int(num[0]) <= self.clients):
+            pattern = "(\w{6}-\d ready)"
+            match = re.search(pattern, data)
+            if match:
+                key = match[0].split(" ")[0]
+                self.timers[key] = time.time()
+                # print("Timer is updated for ", key)
+                # print(f"Timer {key} : {self.timers[key]}")
+        else:
+            print("Unexpected client '{}'".format(data.split(" ")[0]))
+        # for num in range(self.clients):
+        #     print("Timer for Client-{} : {}".format(num+1, self.timers["Client-" + str(num+1)]))
+
+    def get_message(self):
+        message = "I can't work with {} clients".format(self.clients)
+        if(self.clients == 2):
+            message = self._two_clients(self.data)
+            return message
+        elif(self.clients == 3):
+            message = self._three_clients(self.data)
+        elif(self.clients == 4):
+            message = self._four_clients(self.data)
+        return message
+
+    def _two_clients(self, data):
+        self.update_timer(data)
+        message = "Wait"
+        # print("---------- Server wait: {} ----------".format(server_wait))
+        if(self.server_wait == self.server_wait_status[1]):
+            if(data.find("Client-2 ready") != -1):
+                if(self.client2_can_do_step):
+                    message = "Client-2 do step {}".format(self.count)
+                    self.client2_can_do_step = False
+                    self.server_wait = self.server_wait_status[9]
+                    return message
+                else:
+                    return ("Wait for Client-1 finish step {}".format(self.count))
+            else:
+                return ("Wait for 'Client-2 ready'")
+        elif(self.server_wait == self.server_wait_status[9]):
+            if(data.find("Client-2 got the job") != -1):
+                print("--- {} ---".format(self.server_wait))
+                self.server_wait = self.server_wait_status[5]
+                return None
+            else:
+                return "Wait '{}'".format(self.server_wait)
+        elif(self.server_wait == self.server_wait_status[5]):
+            if(data.find("Client-2 done step {}".format(self.count)) != -1):
+                    message = "Client-2 done step {}".format(self.count)
+                    self.client2_done = True
+                    self.server_wait = self.server_wait_status[0]
+                    return data
+            else:
+                return ("Wait for Client-2 finish step {}".format(self.count))
+        elif(self.server_wait == self.server_wait_status[0]):
+            if(data.find("Client-1 ready") != -1):
+                if(self.client2_done == True):
+                    message="Client-1 do step {}".format(self.count)
+                    self.server_wait = self.server_wait_status[8]
+                    return message
+            else:
+                return ("Wait for 'Client-1 ready'")
+        elif(self.server_wait == self.server_wait_status[8]):
+            if(data.find("Client-1 got the job") != -1):
+                print("--- {} ---".format(self.server_wait))
+                self.server_wait = self.server_wait_status[4]
+                return None
+            else:
+                return "Wait '{}'".format(self.server_wait)
+        elif(self.server_wait == self.server_wait_status[4]):
+            if(data.find("Client-1 done step {}".format(self.count)) != -1):
+                self.client2_done = False
+                self.client2_can_do_step = True
+                self.count += 1
+                self.server_wait = self.server_wait_status[1]
+                return data
+            else:
+                return ("Wait for Client-1 finish step {}".format(self.count))
+        else:
+            return ("Unexpected client name")
+
+    def _three_clients(self, data):
+        self.update_timer(data)
+        message = "Wait"
+        # print("---------- Server wait: {} ----------".format(server_wait))
+        if(self.server_wait == self.server_wait_status[1]):
+            if(data.find("Client-2 ready") != -1):
+                if(self.client2_can_do_step):
+                    message = "Client-2 do step {}".format(self.count)
+                    self.client2_can_do_step = False
+                    self.server_wait = self.server_wait_status[9]
+                    return message
+                else:
+                    return ("Wait for Client-1 and Client-3 to complete step {}".format(self.count))
+            else:
+                return ("Wait for Client-2 ready")
+        elif(self.server_wait == self.server_wait_status[9]):
+            if(data.find("Client-2 got the job") != -1):
+                print("--- {} ---".format(self.server_wait))
+                self.server_wait = self.server_wait_status[5]
+                return None
+            else:
+                return "Wait '{}'".format(self.server_wait)
+        elif(self.server_wait == self.server_wait_status[5]):
+            if(data.find("Client-2 done step {}".format(self.count)) != -1):
+                    message = "Client-2 done step {}".format(self.count)
+                    self.client2_done = True
+                    self.client3_can_do_step = True
+                    self.server_wait = self.server_wait_status[2]
+                    return message
+            else:
+                return ("Wait for Client-2 to complete step {}".format(self.count))
+        elif(self.server_wait == self.server_wait_status[2]):
+            if(data.find("Client-3 ready") != -1):
+                    message = "Client-3 do step {}".format(self.count)
+                    self.client3_can_do_step = False
+                    self.server_wait = self.server_wait_status[10]
+                    return message
+            else:
+                return ("Wait for Client-3 ready")
+        elif(self.server_wait == self.server_wait_status[10]):
+            if(data.find("Client-3 got the job") != -1):
+                print("--- {} ---".format(self.server_wait))
+                self.server_wait = self.server_wait_status[6]
+                return None
+            else:
+                return "Wait for '{}'".format(self.server_wait)
+        elif(self.server_wait == self.server_wait_status[6]):
+            if(data.find("Client-3 done step {}".format(self.count)) != -1):
+                    message="Client-3 done step {}".format(self.count)
+                    self.client3_done = True
+                    self.server_wait = self.server_wait_status[0]
+                    return message
+            else:
+                return ("Wait for Client-3 to complete step {}".format(self.count))
+        elif(self.server_wait == self.server_wait_status[0]):
+            if(data.find("Client-1 ready") != -1):
+                if(self.client2_done and self.client3_done):
+                    message="Client-1 do step {}".format(self.count)
+                    self.server_wait = self.server_wait_status[8]
+                    return message
+            else:
+                return ("Wait for 'Client-1 ready'")
+        elif(self.server_wait == self.server_wait_status[8]):
+            if(data.find("Client-1 got the job") != -1):
+                print("--- {} ---".format(self.server_wait))
+                self.server_wait = self.server_wait_status[4]
+                return None
+            else:
+                return "Wait for '{}'".format(self.server_wait)
+        elif(self.server_wait == self.server_wait_status[4]):
+            if(data.find("Client-1 done step {}".format(self.count)) != -1):
+                self.client2_done = False
+                self.client3_done = False
+                self.count += 1
+                self.client2_can_do_step = True
+                self.server_wait = self.server_wait_status[1]
+                return data
+            else:
+                return ("Wait for Client-1 to complete step {}".format(self.count))
+        else:
+            return ("Unexpected client name")
+
+    def _four_clients(self, data):
+        self.update_timer(self.data)
+        message = "Wait"
+        # print("---------- Server wait: {} ----------".format(server_wait))
+        if(self.server_wait == self.server_wait_status[1]):
+            if(data.find("Client-2 ready") != -1):
+                if(self.client2_can_do_step):
+                    message = "Client-2 do step {}".format(self.count)
+                    self.client2_can_do_step = False
+                    self.server_wait = self.server_wait_status[9]
+                    return message
+                else:
+                    return ("Wait for Client-1, Client-3 and Client-4 to complete step {}".format(self.count))
+            else:
+                return ("Wait for '{}'".format(self.server_wait))
+        elif(self.server_wait == self.server_wait_status[9]):
+            if(data.find("Client-2 got the job") != -1):
+                print("--- {} ---".format(self.server_wait))
+                self.server_wait = self.server_wait_status[5]
+                return None
+            else:
+                return "Wait '{}'".format(self.server_wait)
+        elif(self.server_wait == self.server_wait_status[5]):
+            if(data.find("Client-2 done step {}".format(self.count)) != -1):
+                    message = "Client-2 done step {}".format(self.count)
+                    self.client2_done = True
+                    self.client3_can_do_step = True
+                    self.server_wait = self.server_wait_status[2]
+                    return message
+            else:
+                return ("Wait for Client-2 to complete step {}".format(self.count))
+        elif(self.server_wait == self.server_wait_status[2]):
+            if(data.find("Client-3 ready") != -1):
+                    message = "Client-3 do step {}".format(self.count)
+                    self.client3_can_do_step = False
+                    self.server_wait = self.server_wait_status[10]
+                    return message
+            else:
+                return ("Wait for Client-3 ready")
+        elif(self.server_wait == self.server_wait_status[10]):
+            if(data.find("Client-3 got the job") != -1):
+                print("--- {} ---".format(self.server_wait))
+                self.server_wait = self.server_wait_status[6]
+                return None
+            else:
+                return "Wait '{}'".format(self.server_wait)
+        elif(self.server_wait == self.server_wait_status[6]):
+            if(data.find("Client-3 done step {}".format(self.count)) != -1):
+                    message = "Client-3 done step {}".format(self.count)
+                    self.client3_done = True
+                    self.client4_can_do_step = True
+                    self.server_wait = self.server_wait_status[3]
+                    return message
+            else:
+                return ("Wait for Client-3 to complete step {}".format(self.count))
+        elif(self.server_wait == self.server_wait_status[3]):
+            if(data.find("Client-4 ready") != -1):
+                    message = "Client-4 do step {}".format(self.count)
+                    self.client4_can_do_step = False
+                    self.server_wait = self.server_wait_status[11]
+                    return message
+            return ("Wait for Client-4 ready")
+        elif(self.server_wait == self.server_wait_status[11]):
+            if(data.find("Client-4 got the job") != -1):
+                print("--- {} ---".format(self.server_wait))
+                self.server_wait = self.server_wait_status[7]
+                return None
+            else:
+                return "Wait '{}'".format(self.server_wait)
+        elif(self.server_wait == self.server_wait_status[7]):
+            if(data.find("Client-4 done step {}".format(self.count)) != -1):
+                    message = "Client-4 done step {}".format(self.count)
+                    self.client4_done = True
+                    self.server_wait = self.server_wait_status[0]
+                    return message
+            else:
+                return ("Wait for Client-4 to complete step {}".format(self.count))
+        elif(self.server_wait == self.server_wait_status[0]):
+            if(data.find("Client-1 ready") != -1):
+                if(self.client2_done and self.client3_done and self.client4_done):
+                    message = "Client-1 do step {}".format(self.count)
+                    self.server_wait = self.server_wait_status[8]
+                    return message
+                else:
+                    return ("Wait under all other clients done step {}".format(self.count))
+            else:
+                return ("Wait for 'Client-1 ready'")
+        elif(self.server_wait == self.server_wait_status[8]):
+            if(data.find("Client-1 got the job") != -1):
+                print("--- {} ---".format(self.server_wait))
+                self.server_wait = self.server_wait_status[4]
+                return None
+            else:
+                return "Wait '{}'".format(self.server_wait)
+        elif(self.server_wait == self.server_wait_status[4]):
+            if(data.find("Client-1 done step {}".format(self.count)) != -1):
+                self.client2_done = False
+                self.client3_done = False
+                self.client4_done = False
+                self.count += 1
+                self.client2_can_do_step = True
+                self.server_wait = self.server_wait_status[1]
+                return data
+            else:
+                return ("Wait for Client-1 to complete step {}".format(self.count))
+        else:
+            return ("Unexpected client name")
+
+
+class Server:
+    def __init__(self, clients_number, port):
+        self.port = int(port)
+        self.clients = int(clients_number)
+        self.host = socket.gethostbyname(socket.gethostname())
+        self.server_start_time = time.time()
+        self.sel = selectors.DefaultSelector()
+        self.stop_server = False
+        self.client_error = False
+        self.send_to_clients = int(clients_number)
+        self.oFunction = _Functions(self.clients)
+
+    def check_timer(self, numbers):
+        # print("--- Check timer function ---\n", self.oFunction.timers)
+        for key in self.oFunction.timers:
+            if(time.time() - self.oFunction.timers[key] > CLIENT_TIMEOUT):
+                server_table = mua.server_by_port(port=self.port) #"tmua_server7"
+                mua.set_error(script=mua.get_script(host=server_table), error=f"No connections with {key} a very long time")
+                print(f"self.oFunction.timers[key]: {self.oFunction.timers[key]}")
+                raise Exception("No connections with {} a very long time".format(key))
+
+    def now(self):
+        return datetime.now().strftime("%H:%M")
+
+    def accept_wrapper(self, sock, clients):
+        self.check_timer(int(clients))
+        conn, addr = sock.accept()  # Should be ready to read
+        # print("accepted connection from", addr)
+        conn.setblocking(False)
+        data = types.SimpleNamespace(addr=addr, inb=b"", outb=b"")
+        events = selectors.EVENT_READ | selectors.EVENT_WRITE # мы хотим знать, когда клиентское соединение готово для чтения и записи, оба этих события устанавливаются
+        self.sel.register(conn, events, data=data)
+
+    def service_connection(self, key, mask):
+        """
+        По сути: сокет считается доступным для записи, если в буфере записи сокета есть место. Сокет считается доступным для чтения,
+        если в буфере чтения сокета есть данные.
+        """
+        sock = key.fileobj
+        data = key.data
+        recv_data = False
+        if mask & selectors.EVENT_READ:
+            # print("--- EVENT_READ ---")
+            try:
+                recv_data = sock.recv(1024)  # Should be ready to read
+            except Exception as ex:
+                self.sel.unregister(sock)
+                sock.close()
+            else:
+                if recv_data:
+                    print("[{}]: Server receive: {}".format(self.now(), recv_data))
+                    data.outb += recv_data
+                else:
+                    self.sel.unregister(sock)#чтобы сокет больше не контролировался select()
+                    sock.close()
+
+        if mask & selectors.EVENT_WRITE:
+            # print("--- buffer: {} ---".format(data.outb))
+            # print("--- EVENT_WRITE ---")
+            if data.outb:
+                index = data.outb.find(b"@")
+                if index != -1:
+                    client_message = data.outb[:index].decode()
+                    # print("type: ", type(client_message))
+                    # print("self.client_error :", self.client_error)
+                    # print("self.send_to_clients :", self.send_to_clients)
+                    if(client_message.find("got the error. Stop server") != -1):
+                        server_table = mua.server_by_port(port=self.port) #"tmua_server7"
+                        # mua.set_error(script=mua.get_script(host=server_table), server=server_table, error=client_message)
+                        # mua.set_error(script="some script", server=server_table, error=client_message) #Debug code
+                        print("[{}]: --- Server will be stopped because of {} ---".format(self.now(), client_message))
+                        message = "Stop connection with server because {}".format(client_message)
+                        self.client_error = message
+                        self.send_to_clients -= 1
+                    elif(client_message.find("Client-1 finished. All steps done. Stop server") != -1):
+                        print("[{}]: --- 'STOP SERVER' command has been received ---".format(self.now()))
+                        self.stop_server = True
+                        return
+                    elif(client_message.find("finished. All steps done. Stop server") != -1):
+                        pattern = "(\w{6}-\d)"
+                        client = re.search(pattern, client_message)[0]
+                        self.send_to_clients -= 1
+                        self.oFunction.del_timer(key=client)
+                        message = None
+                    elif(self.client_error):
+                        self.send_to_clients -= 1
+                        message = self.client_error
+                    else:
+                        self.oFunction.data = client_message
+                        message = self.oFunction.get_message()
+                    if(message):
+                        print("[{}]: Server send: {}".format(self.now(), message))
+                        data.outb = data.outb[index+1:]     # Обработанные байты удаляются из буфера отправки
+                        sent = sock.send(message.encode())
+                        if(self.send_to_clients == 0):
+                            # print("[{}]: 222 self.send_to_clients = {} ".format(self.now(), self.send_to_clients))
+                            self.stop_server = True
+                    else:
+                        data.outb = data.outb[index+1:]
+            else:
+                time.sleep(0.3)
+
+    def run_server(self):
+        print("clients: {}, port: {}".format(self.clients, self.port))
+        lsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        lsock.bind((self.host, self.port))
+        lsock.listen()
+        print("[{}]: listening on {}".format(self.now(),(self.host, self.port)))
+        lsock.setblocking(False)
+        self.sel.register(lsock, selectors.EVENT_READ, data=None)
+        # try:
+
+        count = 0
+        while not self.stop_server:
+            events = self.sel.select(timeout=None) #вызов будет заблокирован до тех пор, пока отслеживаемый файловый объект не станет готовым
+            for key, mask in events:# mask-маска событий готовых операций
+                if key.data is None:# Если key.data имеет значение None, то он получен из прослушивающего сокета, и нам нужно accept() соединение.
+                    self.accept_wrapper(key.fileobj, self.clients) #key.fileobj-объект сокета
+                else:# Если key.data не равно None, значит, это клиентский сокет, который уже был принят, и нам нужно его обслуживать.
+                    #Затем вызывается service_connection () и передается ключ и маска, которые содержат все, что нам нужно для работы с сокетом.
+                    self.service_connection(key, mask)
+            if (count == 500):
+                if(time.time() - self.server_start_time > SERVER_JOB_TIMEOUT):
+                    raise Exception("--- Server timeout has been triggered ---")
+                else:
+                    print("count set to 0")
+                    count = 0    
+            count += 1
+        # except Exception as ex:
+        #     print("[{}]: --- Server stopped with exception: {} ---".format(self.now(), ex))
+        # finally:
+        #     print("[{}]: Finally block: --- SERVER STOPPED ---".format(self.now()))
+        self.sel.close()
+def server(*args):
+    clients, port = args
+    server = Server(clients, port)
+    server.run_server()
