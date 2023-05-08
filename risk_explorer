@@ -1,0 +1,1000 @@
+"""
+This module contains the RE object (and related bits), which provides
+an interface to UI manipulation and testing of Risk Explorer.
+"""
+
+from . import config
+from . import gditrace
+from . import log
+from . import urs_uimap
+from . import treetable
+from . import ui
+from . import uia
+from . import urs
+from . import win32
+import fnmatch
+import os
+import re
+import shutil
+import subprocess
+import time
+import re
+from contextlib import contextmanager
+import psutil
+
+
+CLIPBOARD_COPY_CHECK_TIMEOUT = 200.0
+PROJECT_OPEN_TIMEOUT = 60.0
+RE_START_TIMEOUT = 5*60.0
+
+class RiskExplorer(urs_uimap.UI_RE):
+    def __init__(self, parent, selector):
+        super().__init__(parent, selector)
+        self.alert_simulation_run_end = urs_uimap.alert_simulation_run_end
+        self.splash_screen = urs_uimap.splash_screen
+        self.re_pid = None
+
+    def kill(self):
+        urs.killallurs()
+
+    def close_splash_screen(self):
+        try:
+            # Try to click the splash screen...
+            left, top, width, height = self.splash_screen.bounding_rectangle
+            win32.click_mouse(left + width/2, top + width/2)
+        except:
+            # ... but if it disappears before the click, that's no big deal.
+            pass
+        self.splash_screen.wait_gone()
+
+
+
+    def launch(self, n_of_instances=1, max_attempts=3):
+        self.kill()
+        instances = []
+        for obj in range(n_of_instances):
+            instances.append(self.launch_one(max_attempts))
+        return instances
+
+    # def launch_one(self, max_attempts=3):
+    #     """
+    #     Start Risk Explorer.
+    #     """
+    #     for _ in range(max_attempts):
+    #         try:
+    #             for studio_path in config.urs_studio_paths:
+    #                 path = os.path.join(studio_path, "Bin", "RiskExplorer.exe")
+    #                 descpath = os.path.join(studio_path, "Bin", "Description.txt")
+    #                 if os.path.exists(path):
+    #                     log.info("Launching Risk Explorer from {!r}", path)
+    #                     pid = subprocess.Popen([path]).pid
+    #                     if os.path.exists(descpath):
+    #                         with open(descpath, "r") as f:
+    #                             log.info("Risk Explorer description: {!r}", f.read().strip())
+    #                     break
+    #                 else:
+    #                     raise Exception("RiskExplorer.exe not found")
+    #             re = RiskExplorer(None,urs_uimap.SELECTOR_MAP["RE"] & (uia.PropertyID.ProcessId == pid))
+    #             re.wait(timeout=RE_START_TIMEOUT)
+    #             re.close_splash_screen()
+    #             re.maximize()
+    #             re.focus()
+    #             if re.ribbon_toolbar.exists:
+    #                 log.info("Disabling Ribbon and restarting RiskExplorer")
+    #                 re.send_keys("[alt][h][y]") # Ribon->Home->(Options)->Application
+    #                 re.dialog_application_options.page_tree.select_item("Appearance")
+    #                 re.dialog_application_options.page_appearance.rbutton_navigation_type_menu.select()
+    #                 re.dialog_application_options.button_ok.click()
+    #                 re.dialog_application_options.dialog_re_needs_restart.ok()
+    #                 re.dialog_application_options.wait_gone()
+    #                 re.close()
+    #                 continue
+    #             gditrace.inject_tracer_dll(re.pid)
+    #             # Enable persistent "Risk Explorer has completed the simulation run" alert window
+    #             re.send_keys("[alt][o][o][a]") # Tools->Options->Application
+    #             re.dialog_application_options.page_tree.select_item("Asset Management")
+    #             re.dialog_application_options.page_asset_management.checkbox_dont_warn_about_missing_purchase_templates.check()
+    #             re.dialog_application_options.page_tree.select_item("Appearance")
+    #             re.dialog_application_options.page_appearance.checkbox_alert_about_completed_simulation_run.check()
+    #             re.dialog_application_options.page_appearance.checkbox_auto_close_alert_about_completed_simulation_run.uncheck()
+    #             re.dialog_application_options.ok()
+    #             return re
+    #         except:
+    #             log.last_exception(status=log.LogStatus.Warning)
+    #     raise Exception("Failed to start Risk Explorer after {} attempts".format(max_attempts))
+    def check_risk_explorer_running(self):
+        """
+        Проверяет, запущен ли уже процесс RiskExplorer.
+        """
+        for process in psutil.process_iter():
+            # log.info(f"=== {process.name()} {process.pid} ===")
+            try:
+                if process.name() == "RiskExplorer.exe":
+                    if self.re_pid != process.pid:
+                        log.info(f"=== RiskExplorer is running with pid={process.pid} and self.re_pid={self.re_pid} ===")
+                        return process.pid
+                    else:
+                        log.info(f"=== self.re_pid={self.re_pid} = process.pid={process.pid} ===")
+                        return False
+                # else:
+                #     log.info(f"=== {process.name()} {process.pid} ===")
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                log.erro("=== Cannot check some process in psutil.process_iter() ===")
+        return False
+
+    def configure_risk_explorer(self, re):
+        """
+        Configure Risk Explorer settings.
+        """
+        re.close_splash_screen()
+        re.maximize()
+        re.focus()
+
+        if re.ribbon_toolbar.exists:
+            log.info("Disabling Ribbon and restarting RiskExplorer")
+            re.send_keys("[alt][h][y]") # Ribon->Home->(Options)->Application
+            re.dialog_application_options.page_tree.select_item("Appearance")
+            re.dialog_application_options.page_appearance.rbutton_navigation_type_menu.select()
+            re.dialog_application_options.button_ok.click()
+            re.dialog_application_options.dialog_re_needs_restart.ok()
+            re.dialog_application_options.wait_gone()
+            re.close()
+            re_pid = self.start_risk_explorer()
+            re = RiskExplorer(None, urs_uimap.SELECTOR_MAP["RE"] & (uia.PropertyID.ProcessId == re_pid))
+            self.configure_risk_explorer(re)
+        else:
+            gditrace.inject_tracer_dll(re.pid)
+            # Enable persistent "Risk Explorer has completed the simulation run" alert window
+            re.send_keys("[alt][o][o][a]") # Tools->Options->Application
+            re.dialog_application_options.page_tree.select_item("Asset Management")
+            re.dialog_application_options.page_asset_management.checkbox_dont_warn_about_missing_purchase_templates.check()
+            re.dialog_application_options.page_tree.select_item("Appearance")
+            re.dialog_application_options.page_appearance.checkbox_alert_about_completed_simulation_run.check()
+            re.dialog_application_options.page_appearance.checkbox_auto_close_alert_about_completed_simulation_run.uncheck()
+            re.dialog_application_options.ok()
+
+    def start_risk_explorer(self):
+        """
+        Start Risk Explorer and return a handle to the Risk Explorer instance.
+        """
+        for studio_path in config.urs_studio_paths:
+            RISK_EXPLORER_PATH = os.path.join(studio_path, "Bin", "RiskExplorer.exe")
+            if not os.path.isfile(RISK_EXPLORER_PATH):
+                log.warning(f"=== RiskExplorer.exe not found at {RISK_EXPLORER_PATH} ===")
+                continue
+            process = subprocess.Popen([RISK_EXPLORER_PATH])
+            print("Launching RiskExplorer...")
+            sec = 0
+            timeout = 20
+            while not self.check_risk_explorer_running():
+                time.sleep(1)
+                sec += 1
+                if (sec == timeout):
+                    raise Exception(f"=== Failed to find Risk Explorer pid after {sec} seconds ===")
+            log.info(f"=== Launched RiskExplorer with pid {process.pid} ===")
+            self.re_pid = process.pid
+            return process.pid
+        raise Exception("=== Failed to find RiskExplorer.exe in any configured URS Studio paths ===")
+
+    def launch_one(self, max_attempts=3):
+        """
+        Start Risk Explorer.
+        """
+        for _ in range(max_attempts):
+            try:
+                if not self.check_risk_explorer_running():
+                    re_pid = self.start_risk_explorer()
+                    re = RiskExplorer(None, urs_uimap.SELECTOR_MAP["RE"] & (uia.PropertyID.ProcessId == re_pid))
+                    re.wait(timeout=30)
+                    self.configure_risk_explorer(re)
+                    return re
+                else:
+                    # re_pid = self.check_risk_explorer_running()
+                    # re = RiskExplorer(None,urs_uimap.SELECTOR_MAP["RE"] & (uia.PropertyID.ProcessId == re_pid))
+                    # if not re.wait(timeout=5, dont_raise_exception=True):
+                    #     log.info("Risk Explorer has most likely been closed. Try to reopen")
+                    #     # raise Exception("Risk Explorer has most likely been closed. Try to reopen")
+                    #     continue
+                    # self.configure_risk_explorer(re)
+                    # return re
+                    time.sleep(1)
+                    continue
+            except:
+                log.last_exception(status=log.LogStatus.Warning)
+        raise Exception("Failed to start Risk Explorer after {} attempts".format(max_attempts))
+
+    def __enter__(self):
+        self.launch()
+
+    def __exit__(self, type, value, traceback):
+        self.kill()
+
+    def open_project(self, path, timeout=50):
+        log.info("Opening project {!r}", path)
+        log.link("{}", os.path.abspath(path))
+        oldname = self.name
+        self.send_keys("^[o]")
+        self.dialog_open.wait()
+        self.dialog_open.open(os.path.abspath(path))
+        # After a project is opened Risk Explorer changes it's name to
+        # "Risk Explorer - <Project Filename.rex>"
+        if (RE.dialog_validation_errors_during_loading.exists):
+            RE.dialog_validation_errors_during_loading.button_ok.click()
+        if (RE.dialog_excessive_unused_space_rms_cat.exists):
+            RE.dialog_excessive_unused_space_rms_cat.button_continue.click()
+        if (RE.dialog_ok.exists):
+            RE.dialog_ok.button_ok.click()
+        if (RE.dialog_connection_to_server.exists):
+            RE.dialog_connection_to_server.button_cancel.click()
+            if (RE.dialog_connection_to_server.exists):
+                RE.dialog_connection_to_server.button_ok.click()
+        if (RE.window_operation_in_progress.dialog_inconsistent_events.exists):
+            RE.window_operation_in_progress.dialog_inconsistent_events.button_ok.click()
+            if (RE.window_operation_in_progress.dialog_ok.exists):
+                RE.window_operation_in_progress.dialog_ok.button_ok.click()
+        if (RE.dialog_inconsistent_events.exists):
+            RE.dialog_inconsistent_events.button_ok.click()
+            if (RE.dialog_ok.exists):
+                RE.dialog_ok.button_ok.click()
+        if (RE.window_operation_in_progress.dialog_ok.exists):
+                RE.window_operation_in_progress.dialog_ok.button_ok.click()
+        for _ in urs.waitloop("project open", timeout=timeout):
+            try:
+                log.info(self.name)
+                if self.name != oldname:
+                    break
+            except:
+                continue
+            if self.dialog_version_mismatch.exists:
+                raise Exception(self.dialog_version_mismatch.text_message.name)
+        if self.dialog_validation_errors_during_loading.exists:
+            self.dialog_validation_errors_during_loading.grid_error_list.rclick_inside()
+            self.dialog_validation_errors_during_loading.popup_menu.choose("Copy")
+            log.info("Validation errors during project loading: {}", win32.get_clipboard())
+            self.dialog_validation_errors_during_loading.ok()
+
+    def close_project(self):
+        self.send_keys("[alt][f][c]") # &File->&Close Project
+        if self.dialog_save_changes.exists:
+            self.dialog_save_changes.no()
+
+    def save_project_as(self, project_name):
+        """
+        Save project as project_name.
+        """
+        self.send_keys("[alt][f][a]") # &File->Save Project &As
+        self.dialog_save_as.wait()
+        self.dialog_save_as.save_as(project_name)
+
+    def save_project(self, hot_keys = True, file_menu = False):
+        """
+        Save project as project_name.
+        """
+        if hot_keys:
+            self.send_keys("[alt][f][s]") # &File-> Save Project
+        elif file_menu:
+            p = self.find_text_region("File")
+            p.click_inside()
+            self.file_menu.choose("Save Project")
+
+
+
+    def start_step_through(self, timeout=30, with_ud_module_tester=False):
+        log.info("Start step-through")
+        oldname = self.name
+        self.send_keys("[f8]")
+        if self.dialog_financial_statements_not_included.exists:
+            self.dialog_financial_statements_not_included.button_include_financial_reports.click()
+        if RE.dialog_re_yes_no.exists:
+            RE.dialog_re_yes_no.checkbox_ignore_this_warning.check()
+            RE.dialog_re_yes_no.button_ok.click()
+        for _ in urs.waitloop("step-through start", timeout=timeout):
+            if self.name != oldname: break
+        if with_ud_module_tester:
+            urs_uimap.ud_module_tester.wait(delay=2, timeout=300)
+        for _ in urs.waitloop("wait for ready status", delay=1, timeout=timeout):
+            self.status_bar.refresh()
+            if self.status_bar.name == "Ready":
+                log.info(self.status_bar.name)
+                log.info("Simulation is started successfully")
+                self.refresh()
+                break
+
+    def continue_step_through(self, timeout=30):
+        log.info("Continue step-through")
+        oldname = self.name
+        self.send_keys("[f8]")
+        for _ in urs.waitloop("wait for ready status", delay=1, timeout=timeout):
+            self.status_bar.refresh()
+            log.info(self.status_bar.name)
+            if self.status_bar.name == "Ready":
+                log.info(self.status_bar.name)
+                log.info("Simulations are continued successfully")
+                break
+        for _ in urs.waitloop("next step", timeout=100):
+            if self.name != oldname: break
+
+    def stop_step_through(self, timeout=30, flag = False):
+        log.info("Stop step-through")
+        self.send_keys("[esc]")
+        # Risk Explorer destroys the simulation tree before it's done
+        # stopping step-through, so this check is not enough for larger
+        # projects.
+            # if self.simulation_tabs.simulation_tree.exists:
+            #     pass
+            # else:
+            #     break
+            # self.simulation_tabs.simulation_tree.wait_gone(timeout)
+        #The sign that Risk Explorer has stopped step through is a word "Ready"
+        # on it`s status bar.
+        for _ in urs.waitloop("wait for ready status", delay=1, timeout=timeout):
+            self.refresh()
+            log.info(self.status_bar.name)
+            self.status_bar.refresh()
+            if flag:
+                break
+            if RE.dialog_re_yes_no.exists:
+                log.info(RE.dialog_re_yes_no.text.value)
+                RE.dialog_re_yes_no.button_no.click()
+            if self.status_bar.name == "Ready":
+                log.info("Simulation is stoped successfully")
+                break
+
+    def start_simulation_run(self, wait_for_yes_no_dialog):
+        log.info("Start full simulation run")
+        self.send_keys("[f5]")
+        if wait_for_yes_no_dialog:
+            self.dialog_re_yes_no.wait()
+            self.dialog_re_yes_no.button_yes.click()
+            self.dialog_save_as.wait(dont_raise_exception=True)
+            if self.dialog_save_as.exists:
+                self.dialog_save_as.button_save.click()
+        try:
+             self.dialog_overwrite_file.wait(5)
+             self.dialog_overwrite_file.yes()
+        except:
+             pass
+
+    def wait_for_simulation_run_end(self, timeout=100):
+        log.debug("Wait for simulation run end")
+        # self.alert_simulation_run_end.wait(delay=1, timeout=timeout)
+        # self.alert_simulation_run_end.dialog.click_inside()
+        # self.alert_simulation_run_end.dialog.send_keys("~[F4]")
+        # self.alert_simulation_run_end.wait_gone()
+        for _ in urs.waitloop("wait for alert",delay = 1, timeout=timeout):
+            if  not self.exists:
+                log.error("Probably RE is crashed")
+                break
+            elif self.alert_simulation_run_end.exists:
+                self.alert_simulation_run_end.dialog.click_inside()
+                self.alert_simulation_run_end.dialog.send_keys("~[F4]")
+                self.alert_simulation_run_end.wait_gone()
+                break
+
+    def add_risk_source(self, path, type):
+        self.project_tree.rclick_item(path)
+        self.popup_menu.send_keys("[down][enter]")
+        self.popup_menu.refresh()
+        self.popup_menu.choose(type)
+
+    def select_distribution_for_numbers(self, dialog_name, page_name, distribution_type,
+        parameters, shift = None,
+        use_random_number_as_simulation_variable = None,
+        truncate_at_min = None, truncate_at_max = None,
+        use_parameter_uncertainty = None,
+        use_distribution_statistic_variables = None):
+        """
+        This function fills fields we need to determine distribution.
+        You can use this function for pages where we have discrete distribution.
+        Such as page_number_of_events.
+        This function was written for page_number_of_events on dialog_properties
+         but U can add definitions for other pages and dialogs
+         (see first_page and my_page definitions).
+         E.g.,
+
+            RE.select_distribution_for_numbers("dialog_properties",
+                "Number of Events","Binomial (type=1)", "0.5\n0.7",
+                truncate_at_min = "0", truncate_at_max = "100",
+                use_parameter_uncertainty = True, shift = "50")
+
+        """
+        my_page = None
+        first_page = None
+        if dialog_name == "dialog_properties":
+            first_page = self.dialog_properties
+        if page_name == "Number of Events":
+            my_page = first_page.page_number_of_events
+        if page_name == "Number of Clashes":
+            my_page = first_page.page_number_of_clashes
+        if page_name == "Number of Losses":
+            my_page = first_page.page_number_of_losses
+        if page_name == "Number of Events (Per Risk)":
+            my_page = first_page.page_number_of_events__per_risk
+
+        first_page.page_tree.click_item(page_name)
+        my_page.combo_select_distribution.select_item(distribution_type)
+        if use_random_number_as_simulation_variable == True:
+            my_page.checkbox_use_random_number_as_simulation_variable.check()
+        elif use_random_number_as_simulation_variable == False:
+            my_page.checkbox_use_random_number_as_simulation_variable.uncheck(timeout=10)
+        if truncate_at_min != None:
+            if truncate_at_min != False:
+                my_page.checkbox_truncate_at_min.check()
+                my_page.edit_truncate_at_min.set_value(truncate_at_min)
+            else:
+                my_page.checkbox_truncate_at_min.uncheck()
+        if truncate_at_max != None:
+            if truncate_at_max != False:
+                my_page.checkbox_truncate_at_max.check()
+                my_page.edit_truncate_at_max.set_value(truncate_at_max)
+            else:
+                my_page.checkbox_truncate_at_max.uncheck()
+        if use_parameter_uncertainty == True:
+            my_page.checkbox_use_parameter_uncertainty.check()
+        elif use_parameter_uncertainty == False:
+            my_page.checkbox_use_parameter_uncertainty.uncheck()
+        if shift != None:
+            my_page.edit_shift.set_value(shift)
+        my_page.grid_parameters.rclick_inside(kx=0, ky=0, dx=5, dy=5)
+        RE.refresh()
+        win32.set_clipboard(parameters)
+        first_page.popup_menu.choose("Paste")
+        # my_page.grid_parameters.send_keys("^[v]")
+        if use_distribution_statistic_variables == True:
+            my_page.checkbox_use_distribution_statistic_variables.check()
+        elif use_distribution_statistic_variables == False:
+            my_page.checkbox_use_distribution_statistic_variables.uncheck()
+        first_page.button_apply.click()
+
+    def select_distribution_for_losses(self, dialog_name, page_name, distribution_type,
+        parameters = None, minimum_before_shift = None, maximum_before_shift = None,
+        mass_at_min = None, mass_at_max = None, shift = None,
+        use_parameter_uncertainty = None,
+        use_distribution_parameter_variables = None,
+        use_random_number_as_simulation_variable = None):
+        """
+        This function fills fields we need to determine distribution.
+        You can use this function for pages where we have continuous distribution.
+        Such as page_loss_size.
+        This function was written for page_loss_size on dialog_properties
+         but U can add definitions for other pages and dialogs
+         (see first_page and my_page definitions).
+         E.g.,
+
+             RE.select_distribution_for_losses("dialog_properties","Loss Size",
+              "Beta (type=2)", "1\n2\n3", maximum_before_shift = "100")
+         """
+        my_page = None
+        first_page = None
+        if dialog_name == "dialog_properties":
+            first_page = self.dialog_properties
+
+        if page_name == "Loss Size":
+            my_page = first_page.page_loss_size
+
+        first_page.page_tree.click_item(page_name)
+        my_page.combo_select_distribution.select_item(distribution_type)
+        if mass_at_min == True:
+            my_page.checkbox_mass_at_min.check()
+        elif mass_at_min == False:
+            my_page.checkbox_mass_at_min.uncheck(timeout=10)
+        if mass_at_max == True:
+            my_page.checkbox_mass_at_max.check()
+        elif mass_at_max == False:
+            my_page.checkbox_mass_at_max.uncheck(timeout=10)
+        if use_parameter_uncertainty == True:
+            my_page.checkbox_use_parameter_uncertainty.check()
+        elif use_parameter_uncertainty == False:
+            my_page.checkbox_use_parameter_uncertainty.uncheck()
+        if shift != None:
+            my_page.edit_shift.set_value(shift)
+        if minimum_before_shift != None:
+            my_page.edit_minimum_before_shift.set_value(minimum_before_shift)
+        if maximum_before_shift != None:
+            my_page.edit_maximum_before_shift.set_value(maximum_before_shift)
+        if use_random_number_as_simulation_variable == True:
+            my_page.checkbox_use_random_number_as_simulation_variable.check()
+        elif use_random_number_as_simulation_variable == False:
+            my_page.checkbox_use_random_number_as_simulation_variable.uncheck()
+        if parameters != None:
+            my_page.grid_parameters.rclick_inside(kx=0, ky=0, dx=5, dy=5)
+            RE.refresh()
+            win32.set_clipboard(parameters)
+            first_page.popup_menu.choose("Paste")
+            # my_page.grid_parameters.send_keys("^[v]")
+        if use_distribution_parameter_variables == True:
+            my_page.checkbox_use_distribution_parameter_variables.check()
+        elif use_distribution_parameter_variables == False:
+            my_page.checkbox_use_distribution_parameter_variables.uncheck(timeout=10)
+
+        first_page.button_apply.click()
+
+    def copy_simulation_tree_expanded(self):
+        with urs.clipboard_copy_loop(timeout=CLIPBOARD_COPY_CHECK_TIMEOUT):
+            self.simulation_tabs.simulation_tree.rclick_item("[0]")
+            self.popup_menu.wait()
+            self.popup_menu.choose("copy*expanded")
+            self.popup_menu.wait_gone()
+
+
+    def find_page(self, path,  page):
+
+        path.refresh()
+        l, t, w, h = path.bounding_rectangle
+        log.info("Looking for page {}", page)
+        if self.get_all_pages(path)[page]>l+w:
+            log.info("NOT found")
+            win32.send_keys("![tab]")
+            return False
+        else:
+            log.info("found")
+            return True
+
+    def get_all_pages(self, path, page=None):
+        dict_tabs = {}
+        dict_tabs_croped = {}
+        for child in path._uia_element.children():
+            if child.get(uia.PropertyID.Name) != "":
+                left, top, width, height = child.get(uia.PropertyID.BoundingRectangle)
+                left_border = left + width
+                dict_tabs[str(child.get(uia.PropertyID.Name))] = left_border
+        log.info("Pages what where found: {}", dict_tabs)
+        if page is not None:
+            if page in dict_tabs:
+                log.info("There is a page {}", page)
+                dict_tabs_croped[page] = dict_tabs[page]
+            return dict_tabs_croped
+        else:
+            return dict_tabs
+
+    def get_simulation_tree(self, raw=False, expanded=False, page=None, long_timeout=0):
+        self.simulation_tabs.refresh()
+        pages = self.get_all_pages(self.simulation_tabs, page).keys()
+        results = []
+        for p in sorted(pages):
+            tempt = 1
+            while not self.find_page(self.simulation_tabs, p):
+                if tempt > 5:
+                    log.error("Could not find existing page")
+                    self.kill()
+                self.find_page(self.simulation_tabs, p)
+                tempt +=1
+            self.simulation_tabs.click_tab(p)
+            if long_timeout > 0:
+                for _ in urs.waitloop("wait for Simulation tree exists", delay=1, timeout=long_timeout):
+                    self.refresh()
+                    if self.simulation_tabs.simulation_tree.exists:
+                        log.info("Simulation tree exists")
+                        break
+                    log.info("Risk Explorer is not responding yet")
+            self.simulation_tabs.simulation_tree.refresh()
+            self.copy_simulation_tree_expanded()
+            text = win32.get_clipboard()
+            if not raw:
+                text = treetable.normalize(text)
+            if not expanded:
+                text = treetable.remove_subtotals(text)
+                text = treetable.remove_empty_columns(text)
+            results.append((p, text))
+        if len(results) == 1: return results[0][1]
+        return "\n\n".join("=== Page: {} ===\n{}".format(*r) for r in results)
+
+    def get_simulation_variables_tree(self, page):
+        self.simulation_tabs.simulation_tree.send_keys("^![down]") # Switch to simulation variables
+        self.simulation_variables_tabs.refresh()
+        pages = \
+            self.get_all_pages(self.simulation_variables_tabs, page).keys()
+        results = []
+        for p in sorted(pages):
+            while not self.find_page(self.simulation_variables_tabs, p):
+                self.find_page(self.simulation_variables_tabs, p)
+            self.simulation_variables_tabs.click_tab(p)
+            self.simulation_variables_tabs.simulation_tree.refresh()
+            with urs.clipboard_copy_loop(timeout=CLIPBOARD_COPY_CHECK_TIMEOUT):
+                self.simulation_variables_tabs.simulation_tree.rclick_item("[0]")
+                self.popup_menu.wait()
+                self.popup_menu.choose("copy*expanded")
+                self.popup_menu.wait_gone()
+            results.append((p, win32.get_clipboard()))
+        self.simulation_variables_tabs.simulation_tree.send_keys("^![up]") # Switch back to the simulation tree
+        if len(results) == 1: return results[0][1]
+        return "\n\n".join("=== Page: {} ===\n{}".format(*r) for r in results)
+
+    def get_cat_events_tree(self, page=None):
+        self.simulation_tabs.simulation_tree.send_keys("^![down]^![down]") # Switch to simulation variables
+        self.simulation_cat_events_tabs.refresh()
+        pages = \
+            self.get_all_pages(self.simulation_cat_events_tabs, page).keys()
+        results = []
+        for p in sorted(pages):
+            while not self.find_page(self.simulation_cat_events_tabs, p):
+                self.find_page(self.simulation_cat_events_tabs, p)
+            self.simulation_cat_events_tabs.click_tab(p)
+            self.simulation_cat_events_tabs.simulation_tree.refresh()
+            with urs.clipboard_copy_loop(timeout=CLIPBOARD_COPY_CHECK_TIMEOUT):
+                self.simulation_cat_events_tabs.simulation_tree.rclick_item("[0]")
+                self.popup_menu.wait()
+                self.popup_menu.choose("copy*expanded")
+                self.popup_menu.wait_gone()
+            results.append((p, win32.get_clipboard()))
+        self.simulation_cat_events_tabs.simulation_tree.send_keys("^![up]^![up]") # Switch back to the simulation tree
+        if len(results) == 1: return results[0][1]
+        return "\n\n".join("=== Page: {} ===\n{}".format(*r) for r in results)
+
+    def autotest_project(self, path, vp_prefix, timeout=50, stop_timeout=50, long_timeout=0):
+        """
+        Open the given project, verify step-through results via
+        autotest_step(vp_prefix), exit Risk Explorer.
+
+        See 'autotest_step' for how to use this function.
+        """
+        with self:
+            self.open_project(path, timeout)
+            self.autotest_step(vp_prefix, timeout, stop_timeout, long_timeout)
+
+    def autotest_step(self, vp_prefix, timeout=50, stop_timeout=10, long_timeout=0):
+        """
+        Start step-through, check various financials against verification
+        points, stop step-through.
+
+        More specifically, search for all verifications points under
+        the given prefix, and for each one verify the financial statement
+        with the same name.
+
+        Additionally, recognize bracket-enclosed tags in VP names,
+        and act accordingly.
+
+        For example, if these verification points exist:
+            vp/example/test/Company1 - Cash Flows [Expanded] [Step=2]
+            vp/example/test/Company2 - Uwrt Period Financials
+            vp/example/test/Company2 - Income Statement, GAAP
+        ... then running autotest_step("vp/example/test") will verify
+        Uwrt and Income Statement from Company2 on the 1-st step, and
+        Cash Flows (in expanded form) from Company1 on the 2-nd step.
+
+        Supported tags:
+            [Expanded]
+                Copy the financial statement in fully expanded form.
+                Normally this routine skips subnodes of the lowest level.
+            [Step=<N>]
+                Copy the financial statement on this step.
+                By default step 1 is used.
+            [Raw]
+                Copy the financial statement as-is, without normalization.
+                Normally copied data is normalized by 'treetable.normalize'
+                function.
+            [Page=<Name>]
+                Copy this page of the simulation tree. By default all pages
+                are copied and joined together.
+            [Statistics Report]
+                Copy and check a given statistics report.
+            [Asset Allocation]
+                Copy and check Asset Allocation Watch Window data.
+            [Simulation Variables]
+                Copy and check the full Simulation Variables tree.
+            [Asset Migration]
+                Copy and check Asset Migration Viewer data.
+        """
+        rx = re.compile(r"\[([^\]=]+)(?:(=)([^\]]+))?\]")
+        def vp_to_tags(vp):
+            tags = {
+                "name": rx.sub("", vp).strip(),
+                "page": None,
+                "step": "1",
+                "expanded": False,
+                "raw": False,
+                "asset allocation": False,
+                "simulation variables": False,
+                "statistics report": False,
+                "asset migration": False,
+                "cat events": False
+            }
+            for tag, eq, value in rx.findall(vp):
+                tag = tag.lower()
+                if tag not in tags:
+                    log.warning("Unknown tag in VP {!r}: {!r}", vp, tag)
+                tags[tag] = value if eq else True
+            return tags
+        vplist = urs.list_vps(vp_prefix)
+        taglist = [vp_to_tags(vp) for vp in vplist]
+        used = set()
+        nsteps = max((int(tag["step"]) for tag in taglist), default=1)
+        self.start_step_through(timeout)
+        self.refresh()
+        if not self.step_through_navigation_list.exists:
+            # Menu -> View -> Step-Through Navigation Window
+            RE.send_keys("[alt][v][t]") # Menu "View"
+            # RE.popup_menu.choose("step*through*navigation*")
+        navitems = self.step_through_navigation_list.items
+        if RE.dialog_distributed_simulation_log.exists:
+            RE.dialog_distributed_simulation_log.close()
+            RE.dialog_distributed_simulation_log.wait_gone()
+        for step in range(1, nsteps + 1):
+            flag = False
+            if step != 1: self.continue_step_through(stop_timeout)
+            for i, (vp, tags) in enumerate(zip(vplist, taglist)):
+                if tags["step"] != str(step):
+                    continue
+                if tags["statistics report"]:
+                    flag = True
+                    continue
+                if tags["simulation variables"]:
+                    text = self.get_simulation_variables_tree(page=tags["page"])
+                    urs.check_text(os.path.join(vp_prefix, vp), text)
+                    used.add(i)
+                    continue
+                if tags["cat events"]:
+                    text = self.get_cat_events_tree(page=tags["page"])
+                    urs.check_text(os.path.join(vp_prefix, vp), text)
+                    used.add(i)
+                    continue
+                if tags["asset allocation"]:
+                    # TODO: do something about "name", "raw" and "expanded" tags
+                    text = self.get_asset_allocation_watch()
+                    urs.check_text(os.path.join(vp_prefix, vp), text)
+                    used.add(i)
+                    continue
+                if tags["asset migration"]:
+                    # TODO: do something about "name", "raw" and "expanded" tags
+                    text = self.get_asset_migration_viewer()
+                    urs.check_text(os.path.join(vp_prefix, vp), text)
+                    used.add(i)
+                    continue
+                for name in navitems:
+                    # log.info("Name:{}", name)
+                    cleanname = re.sub(r" \(Defaulted at [^)]*\)", "", name)
+                    # log.info("Cleanname:{}", cleanname)
+                    if tags["name"] == cleanname:
+                        while ((re.sub(r" \(Defaulted at [^)]*\)", "", RE.report_tab_name.name)  != cleanname) and (re.sub(r" \(Defaulted at [^)]*\)", "", RE.report_tab_name.name) != cleanname + " - SIMULATION JUMP MODE")):
+                            log.info("Active report is {}",  re.sub(r" \(Defaulted at [^)]*\)", "", RE.report_tab_name.name))
+                            log.info("Selecting report {}", name)
+                            self.step_through_navigation_list.select_item(name)
+                            self.simulation_tabs.simulation_tree.refresh()
+                        log.info("Active report is {}",  re.sub(r" \(Defaulted at [^)]*\)", "", RE.report_tab_name.name))
+                        text = self.get_simulation_tree(
+                            raw=tags["raw"],
+                            expanded=tags["expanded"],
+                            page=tags["page"], long_timeout=long_timeout)
+                        urs.check_text(os.path.join(vp_prefix, vp), text)
+                        used.add(i)
+        self.stop_step_through(stop_timeout, flag)
+        for i, (vp, tags) in enumerate(zip(vplist, taglist)):
+            if not tags["statistics report"]:
+                continue
+            text = self.get_statistics_report(tags["name"])
+            urs.check_text(os.path.join(vp_prefix, vp), text)
+            used.add(i)
+        for i, vp in enumerate(vplist):
+            if i not in used:
+                log.error("VP {!r} was not verified by 'autotest_step'", vp)
+
+    def autorun_for_averaged_financials(self, vp_prefix, timeout, wait_for_yes_no_dialog, vp_prefix_another=None):
+        """
+        Start simulation_run, check averaged financials against verification
+        points.
+
+        More specifically, search for all verifications points under
+        the given prefix, and for each one verify the financial statement
+        with the same name.
+
+        Additionally, recognize bracket-enclosed tags in VP names,
+        and act accordingly.
+
+
+        Supported tags:
+            [Expanded]
+                Copy the financial statement in fully expanded form.
+                Normally this routine skips subnodes of the lowest level.
+            [Raw]
+                Copy the financial statement as-is, without normalization.
+                Normally copied data is normalized by 'treetable.normalize'
+                function.
+            [Page=<Name>]
+                Copy this page of the simulation tree. By default all pages
+                are copied and joined together.
+            [Statistics Report]
+                Copy and check a given statistics report.
+            [Asset Allocation]
+                Copy and check Asset Allocation Watch Window data.
+            [Another Report]
+                Copy and check the another Averaged Financials Report.
+        """
+        RE.start_simulation_run(wait_for_yes_no_dialog)
+        RE.wait_for_simulation_run_end()
+        RE.check_vp_for_averaged_financials(vp_prefix)
+        if vp_prefix_another is not None:
+            self.simulation_tabs.simulation_tree.send_keys("^![down]")
+            RE.check_vp_for_averaged_financials(vp_prefix_another)
+
+    def check_vp_for_averaged_financials(self, vp_prefix):
+        rx = re.compile(r"\[([^\]=]+)(?:(=)([^\]]+))?\]")
+        def vp_to_tags(vp):
+            tags = {
+                "name": rx.sub("", vp).strip(),
+                "page": None,
+                "expanded": False,
+                "raw": False,
+                # "another report": False,
+                "statistics report": False
+            }
+            for tag, eq, value in rx.findall(vp):
+                tag = tag.lower()
+                if tag not in tags:
+                    log.warning("Unknown tag in VP {!r}: {!r}", vp, tag)
+                tags[tag] = value if eq else True
+            return tags
+        vplist = urs.list_vps(vp_prefix)
+        taglist = [vp_to_tags(vp) for vp in vplist]
+        used = set()
+        nsteps = 1
+        navitems = self.step_through_navigation_list.items
+        for step in range(1, nsteps + 1):
+            if step != 1: self.continue_step_through(stop_timeout)
+            for i, (vp, tags) in enumerate(zip(vplist, taglist)):
+                if tags["statistics report"]:
+                    continue
+                # if tags["another report"]:
+                #     self.simulation_tabs.simulation_tree.send_keys("^![down]")
+                #     # text = self.get_simulation_variables_tree(page=tags["page"])
+                #     # urs.check_text(os.path.join(vp_prefix, vp), text)
+                #     # used.add(i)
+                #     continue
+                for name in navitems:
+                    cleanname = re.sub(r" \(Defaulted at [^)]*\)", "", name)
+                    if tags["name"] == cleanname:
+                        self.step_through_navigation_list.select_item(name)
+                        self.simulation_tabs.simulation_tree.refresh()
+                        text = self.get_simulation_tree(
+                            raw=tags["raw"],
+                            expanded=tags["expanded"],
+                            page=tags["page"])
+                        urs.check_text(os.path.join(vp_prefix, vp), text)
+                        used.add(i)
+        for i, (vp, tags) in enumerate(zip(vplist, taglist)):
+            if not tags["statistics report"]:
+                continue
+            text = self.get_statistics_report(tags["name"])
+            urs.check_text(os.path.join(vp_prefix, vp), text)
+            used.add(i)
+        for i, vp in enumerate(vplist):
+            if i not in used:
+                log.error("VP {!r} was not verified by 'autotest_step'", vp)
+
+    def install_statistics_report(self, path, name):
+        """
+        Place a given statistics report (.rtm file) under the "Other Reports"
+        node in the statistics report tree.
+
+        Note that you need to restart Risk Explorer for it to find
+        the newly added reports.
+        """
+        log.info("Install statistics report {!r} from {!r}", name, path)
+        rtm = os.path.join(os.environ["APPDATA"], "Ultimate Risk Solutions\\RiskExplorer\\Other Reports", name + ".rtm")
+        shutil.copy(path, rtm)
+
+    def remove_statistics_report(self, name):
+        """
+        Remove a statistics report previously installed by
+        install_statistics_report.
+        """
+        log.info("Remove statistics report {!r}", name)
+        rtm = os.path.join(os.environ["APPDATA"], "Ultimate Risk Solutions\\RiskExplorer\\Other Reports", name + ".rtm")
+        os.remove(rtm)
+
+    def get_statistics_report(self, report_name):
+        """
+        Get statistics report data, assuming Statistics Reports window
+        is opened.
+        """
+        parts = []
+        for item in self.dialog_statistics_reports.report_tree.get_leafs("Reports|" + report_name):
+            self.dialog_statistics_reports.report_tree.click_item(item)
+            pages = []
+            list_reg = RE.dialog_statistics_reports.pane.all_text_regions()
+            left, top, width, height = RE.dialog_statistics_reports.pane.bounding_rectangle
+            for to in sorted(list_reg):
+                if ((to.y2)>7*(top+height)/8):
+                    to.click_inside()
+            #         time.sleep(5)
+            # for to in sorted(gditrace.trace_hwnd(self.pid, self.dialog_statistics_reports.report_tabs.hwnd)):
+            #     to.click_inside()
+                    self.dialog_statistics_reports.pane.report_grid.refresh()
+                    self.dialog_statistics_reports.pane.report_grid.rclick_inside()
+                    self.dialog_statistics_reports.popup_menu.wait()
+                    with urs.clipboard_copy_loop():
+                        self.dialog_statistics_reports.popup_menu.choose("Copy")
+                    pages.append("== Page: {} ==\n{}".format(to.text, win32.get_clipboard()))
+            parts.append("==== Item: {} ====\n{}".format(item, "\n".join(pages)))
+        return "\n".join(parts)
+
+    def get_asset_allocation_watch(self):
+        """
+        Enable Asset Allocation Watch Window, copy all of it's data,
+        disable it, return the data.
+        """
+        result = []
+        RE.send_keys("[alt][v][w]") # View->Asset Allocation Watch Window
+        for to in sorted(gditrace.trace_hwnd(RE.pid, RE.asset_allocation_watch_window.window_tabs.hwnd)):
+            if not re.fullmatch("[0-9]{4}", to.text): continue
+            to.click_inside()
+            result.append("==== Page: {} ====".format(to.text))
+            RE.asset_allocation_watch_window.window_tabs.send_keys("[home][sub]")
+            RE.asset_allocation_watch_window.rclick_inside(kx=0, dx=5, ky=0, dy=5)
+            with urs.clipboard_copy_loop():
+                RE.popup_menu.choose("Copy Expanded")
+            result.append(win32.get_clipboard())
+            RE.asset_allocation_watch_window.window_tabs.send_keys("[down][sub]")
+            RE.asset_allocation_watch_window.rclick_inside(kx=0, dx=5, ky=0, dy=5)
+            with urs.clipboard_copy_loop():
+                RE.popup_menu.choose("Copy Expanded")
+            result.append(win32.get_clipboard())
+        RE.send_keys("[alt][v][w]") # View->Asset Allocation Watch Window
+        return "\n\n".join(result)
+
+    def get_asset_migration_viewer(self):
+        """
+        Enable Asset Migration Viewer, copy all of it's data,
+        disable it, return the data.
+        """
+        result = []
+        RE.send_keys("[alt][v][a]") # View->Asset Migration Viewer
+        for to in sorted(gditrace.trace_hwnd(RE.pid, RE.asset_migration_viewer.window_tabs.hwnd)):
+            if not re.fullmatch("[0-9]{4}", to.text): continue
+            to.click_inside()
+            result.append("==== Page: {} ====".format(to.text))
+            RE.asset_migration_viewer.window_tabs.send_keys("[home][sub]")
+            RE.asset_migration_viewer.rclick_inside(kx=0, dx=5, ky=0, dy=5)
+            with urs.clipboard_copy_loop():
+                RE.popup_menu.choose("Copy Expanded")
+            result.append(win32.get_clipboard())
+            RE.asset_migration_viewer.window_tabs.send_keys("[down][sub]")
+            RE.asset_migration_viewer.rclick_inside(kx=0, dx=5, ky=0, dy=5)
+            with urs.clipboard_copy_loop():
+                RE.popup_menu.choose("Copy Expanded")
+            result.append(win32.get_clipboard())
+        RE.send_keys("[alt][v][w]") # View->Asset Migration Viewer
+        return "\n\n".join(result)
+
+    def open_properties(self, tree_path, properties_page_path=None, from_step=False):
+        """
+        Right-click a project tree item, select "Properties", and click on
+        a property page tree.
+
+        For example:
+
+            open_properties("Project1|Companies|Company1", "General")
+        """
+        try:
+            self.project_tree.rclick_leftside_item(tree_path)
+        except:
+            self.strategy_tree.rclick_leftside_item(tree_path)
+        self.popup_menu.choose("Properties*")
+        if  from_step:
+            RE.dialog_re_yes_no.button_no.click()
+        if properties_page_path is not None:
+            self.dialog_properties.page_tree.click_inside_item(properties_page_path)
+        self.dialog_properties.wait()
+
+    def replace_using_regular_expr(self, clipboard, reg_expression=r"(\w\w\w\s\w\w\w(\s|(\s\s))((\d\s)|(\d\d\s)))(([0,1][0-9])|(2[0-3])):([0-5][0-9]):([0-5][0-9])\s\d\d\d\d",
+     replacement_expression="Date time year"):
+        # pattern = r"(\w\w\w\s\w\w\w(\s|(\s\s))((\d\s)|(\d\d\s)))(([0,1][0-9])|(2[0-3])):([0-5][0-9]):([0-5][0-9])\s\d\d\d\d"
+        output = (re.sub(reg_expression, replacement_expression, clipboard))
+        return output
+
+@contextmanager
+def use_RE(newre):
+    # oldselector =RE._selector
+    # oldcach = RE._cached_uia_element
+    # oldparent = RE._parent
+    olddict = RE.__dict__
+    RE.__dict__ = newre.__dict__
+    # RE._selector, RE._cached_uia_element, RE._parent = newre._selector, newre._cached_uia_element, newre._parent
+    try:
+        RE.focus()
+        yield
+    finally:
+        # RE._selector, RE._cached_uia_element, RE._parent = oldselector, oldcach, oldparent
+        RE.__dict__ = olddict
+
+
+RE = RiskExplorer(None, urs_uimap.SELECTOR_MAP["RE"])
