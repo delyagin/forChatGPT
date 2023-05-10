@@ -1,0 +1,886 @@
+
+#Global version
+#2021-10-11 by Yelagin Aleksej for MUA Ryzen02-Server Agent
+#powershell -ExecutionPolicy Bypass -File "\\file-server\B-Test\AElagin\Multi-Access\In_domain\ryzen02-server-agent-sql.ps1"
+#Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+write-host "ver. 2023-19-01"
+$SqlServer = "SQLVM\SQL";
+$SqlDB = "MUA-DB";
+$SqlLogin = "tester";
+$SqlPassw = "12345"
+
+$repositoryPath="C:\MUA\URS-Test"
+$descriptionPath = "C:\Program Files\Ultimate Risk Solutions\URS Application Studio\Bin\Description.txt"
+$info_path = "C:\MUA\info"
+$timeOut = 15
+$revision = "MUA"
+$LogDate = (Get-Date).tostring("yyyyMMdd-HH-mm-ss")
+$LogPath = "C:\Users\Administrator\Documents\Log-" + $LogDate + ".txt"
+Write-Host $LogPath
+#$Global:currentJobRunning=$false
+$showLog = $true
+
+$listServerStatus = New-Object Collections.Generic.List[String]
+$dictServerStatus=@{}
+$list = new-object 'System.Collections.Generic.List[string]'
+$serversList = new-object 'System.Collections.Generic.List[string]'
+$clientsList = new-object 'System.Collections.Generic.List[string]'
+$clientsToKillCMD = new-object 'System.Collections.ArrayList'
+
+$get_tables_query = '$queryText = "SELECT TABLE_NAME FROM [MUA-DB].INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE=''BASE TABLE''"'
+$get_records_number = '$queryText ="SELECT COUNT(*) FROM $table;"'
+$get_id_query = '$queryText ="SELECT ID FROM $table;"'
+$get_status_query = '$queryText ="SELECT status FROM $table WHERE id=$value"'
+$change_status_query = '$queryText ="UPDATE $table SET status=''$status'' WHERE id=$value;"'
+$get_host_name = '$queryText ="SELECT vm_host_name FROM $table WHERE id=$value;"'
+$get_server_name = '$queryText ="SELECT server_name FROM $table WHERE id=$value;"'
+$get_script_name_query = '$queryText ="SELECT script_name FROM $table WHERE id=$value;"'
+$get_total_clients = '$queryText ="SELECT total_clients FROM $table WHERE id=$value"'
+$get_revision_query = '$queryText ="SELECT revision FROM $table WHERE id=$value"'
+$get_url = '$queryText ="SELECT repository FROM $table WHERE id=$value;"'
+$get_build_path = '$queryText ="SELECT build_path FROM $table WHERE id=$value;"'
+$get_time_query = '$queryText ="SELECT [time] FROM $table WHERE id=$value;"'
+$get_user_query = '$queryText ="SELECT $clientU FROM $table WHERE id=$value;"'
+$insert_into_table = '$queryText = "INSERT INTO $table (total_clients,server_name,script_name,status,revision,repository,build_path,client,[time],port) `
+                    VALUES (''$totalClients'',''$serverName'',''$scriptName'',''$status'',''$revision'',''$repoURL'',''$buildPath'',''$clientNumber'',''$time'',''$port'')"'
+$delete_rec_query = '$queryText = "DELETE FROM $table WHERE id=$value;"'
+$update_rec_query = '$queryText = "Update $table SET vm_name=NULL,script_name=NULL,total_clients=NULL,status=NULL,revision=NULL, `
+                    repository=NULL,build_path=NULL,[time]=NULL,client1=NULL,client2=NULL,client3=NULL,client4=NULL,  `
+                    error=NULL,port=NULL WHERE id=$value;"'
+$get_port = '$queryText ="SELECT port FROM $table WHERE id=$value;"'
+$insert_client_query = '$queryText = "INSERT INTO $table (script, vm_name, date) `
+                    VALUES (''$script'',''$client'',''$date'')"'
+
+function Log-Message($Logfile, [String]$Message){
+    Try {
+        #Add Content to the Log File
+        $TimeStamp = (Get-Date).toString("dd/MM/yyyy HH:mm:ss:fff tt")
+        $Line = "$TimeStamp - $Message"
+        Add-content -Path $Logfile -Value $Line
+
+        #Write-host "Message: '$Message' Has been Logged to File: $LogFile"
+    }
+    Catch {
+        Write-host -f Red "Error:" $_.Exception.Message
+    }
+}
+
+function update_repository ($revision){
+        process{
+            Write-Host "Update repository..."
+            Set-Location $repositoryPath
+            hg pull --update
+            $success = $?
+            write-host "success:" $success
+            if($success){
+                hg update $revision
+                Write-Host "Update completed"
+            }
+            else{
+                write-host "Use hg recover"
+                hg recover
+                hg pull --update
+                hg update
+                Write-Host "Update completed"
+            }
+
+            }
+}
+function run-sql($query, $value, $table, $status){
+    $list.Clear()
+    $SqlConnection = New-Object System.Data.SqlClient.SqlConnection
+    $SqlConnection.ConnectionString = "Server=$SqlServer; Database=$SqlDB; User ID=$SqlLogin; Password=$SqlPassw;"
+    try{
+        $SqlConnection.Open()
+        $SqlCmd = $SqlConnection.CreateCommand()
+        Invoke-Expression $query
+        $SqlCmd.CommandText = $queryText
+        #write-host "!!!!!!!!: "$queryText
+        $objReader = $SqlCmd.ExecuteReader()
+        while ($objReader.read()) {
+          $list.Add($objReader.GetValue(0))
+          #write-host "---: " $objReader.GetValue(0)
+        }
+          $objReader.close()
+          $SqlConnection.close()
+          return $list
+    }
+    catch{
+         try{
+                $objReader.close()
+                $SqlConnection.close()
+                #write-host "Catch1 --- return 0 ---"
+                return 0
+           }
+        catch{
+                 #write-host "Catch2 --- return 0 ---"
+                 return 0
+             }
+}}
+
+$tables = run-sql $get_tables_query '0' '0'
+foreach ($table in $tables){
+    if ($table.StartsWith('mua_server')){
+        $serversList.Add($table)
+       }
+    if($table.StartsWith('mclient')){
+          $clientsList.Add($table)
+      }
+    #else{  $clientsList.Add($table)  }
+}
+
+Write-Host "[active servers]: " $serversList
+Write-Host "[active clients]: " $clientsList
+foreach($server in $serversList){
+    #Write-Host "Hash calling"
+    #$dictServerStatus.Add($server.ToString(), $false.ToString())
+    $dictServerStatus[$server] = $false
+}
+#Write-Host "Server status: " $dictServerStatus["mua_server1"] #.keys | foreach {$dictServerStatus.$_.handles}
+
+ function run-sql-insert($table,$query,$totalClients,$hostNameServer,$scriptName,$status,$revision,$url,$buildPath,$clientNumber,$time){
+    $list.Clear()
+    $SqlConnection = New-Object System.Data.SqlClient.SqlConnection
+    $SqlConnection.ConnectionString = "Server=$SqlServer; Database=$SqlDB; User ID=$SqlLogin; Password=$SqlPassw;"
+    try{
+        $SqlConnection.Open()
+        $SqlCmd = $SqlConnection.CreateCommand()
+        Invoke-Expression $query
+        #write-host $queryText
+        $SqlCmd.CommandText = $queryText
+        $objReader = $SqlCmd.ExecuteReader()
+        while ($objReader.read()) {
+          $list.Add($objReader.GetValue(0))
+          #write-host "---: " $objReader.GetValue(0)
+        }
+          $objReader.close()
+          $SqlConnection.close()
+          return $list
+    }
+    catch{
+         try{
+                write-host "Error in run-sql-insert: $Error[0]" -BackgroundColor Red
+                $objReader.close()
+                $SqlConnection.close()
+                write-host "Catch1 --- return 0 ---"
+                return 0
+           }
+        catch{
+                 write-host "Catch2 --- return 0 ---"
+                 return 0
+             }
+    }
+ }
+
+ function insert_used_client($table, $query, $script, $client, $time){
+    $list.Clear()
+    $SqlConnection = New-Object System.Data.SqlClient.SqlConnection
+    $SqlConnection.ConnectionString = "Server=$SqlServer; Database=$SqlDB; User ID=$SqlLogin; Password=$SqlPassw;"
+    #Write-Host "query: $query"
+    #Write-Host "script: $script"
+    #Write-Host "client: $client"
+    #Write-Host "table: $table"
+    try{
+        $SqlConnection.Open()
+        $SqlCmd = $SqlConnection.CreateCommand()
+        Invoke-Expression $query
+        #write-host $queryText
+        $SqlCmd.CommandText = $queryText
+        $objReader = $SqlCmd.ExecuteReader()
+        while ($objReader.read()) {
+          $list.Add($objReader.GetValue(0))
+          #write-host "---: " $objReader.GetValue(0)
+        }
+          $objReader.close()
+          $SqlConnection.close()
+          write-host "$client has been added successfully" -BackgroundColor Yellow
+          return $list
+    }
+    catch{
+         try{
+                write-host "Error in insert_used_client: $Error[0]" -BackgroundColor Red
+                $objReader.close()
+                $SqlConnection.close()
+                write-host "Catch1 --- return 0 ---"
+                return 0
+           }
+        catch{
+                 write-host "Catch2 --- return 0 ---"
+                 return 0
+             }
+    }
+ }
+
+function rows_number($table){
+    #Write-Host "ROWS NUMBER PATH: " $pathDB
+    $rows = run-sql $get_records_number '0' $table
+    #write-host "Rows: " $rows -ForegroundColor Yellow
+    return $rows
+}
+
+function vm_select($needMachines){
+    $dict=@{}
+    $count=0
+    $attempts = 10
+    while($attempts){
+        $date = now
+        foreach($client in $clientsList){
+            $jobs = rows_number($client)
+            #Write-Host "[$date]: jobs on $client : === $jobs ==="
+            if(($jobs -eq 0) -and (-not $dict.ContainsValue($client)) ){
+                $dict.Add($count.toString(),$client)
+                $count += 1
+                if ($count -eq $needMachines){
+                    return $dict
+                }
+            } else { continue }
+        }
+        $attempts -= 1
+        client-remove-job
+        sleep 1
+    }
+    return $false
+    }
+
+function vm_select2($needMachines){
+    $emptyTables=@()
+    $count=0
+    $attempts = 10
+    while($emptyTables.Count -lt $needMachines){
+        $emptyTables=@()
+        $date = now
+        foreach($client in $clientsList){
+            $jobs = rows_number($client)
+            #Write-Host "[$date]: jobs on $client : === $jobs ==="
+            if( $jobs -eq 0 ){
+                $emptyTables += $client
+        }
+     }
+        $attempts++
+
+        if ($attempts -eq 10) {
+            Log-Message $LogPath "Can't find $needMachines for script"
+            return $false
+        }
+
+        client-remove-job
+        Start-Sleep -Seconds 2
+    }
+    return $emptyTables
+    }
+
+function get_local_build($path){
+  if(Test-Path -Path $path){
+     $file_data = (Get-Content $path).Trim() #Removes all leading and trailing white-space
+     return $file_data
+   }
+   else{
+        Write-Host "Incorrect path: $path" -ForegroundColor Red
+        return $false
+   }
+}
+function local_build_path(){
+    $path_12x = "\\file-server\URS Application Studio Setup\Version 12\x64\URSApplicationStudio-"
+    $path_dlls = "\\file-server\URS Application Studio Setup\Version 12\dlls\x64\URSApplicationStudio-"
+    $data = get_local_build $descriptionPath
+    $res_path = $path_12x + $data + ".msi"
+    if (Test-Path -Path $res_path) { return $res_path }
+    else {
+        return $path_dlls + $data + ".msi"
+    }
+}
+
+function check_build($build_path){
+   if (Test-Path -Path $descriptionPath){
+       $local_build = get_local_build $descriptionPath
+       #Write-Host "local build: $local_build"
+       #Write-Host "  new build: $build_path"
+       if ($build_path.Contains($local_build)){ return $true }
+       else{ return $false}
+    }
+    else { return $false }
+}
+
+function msi_uninstall_local($path){
+        try{
+            if (Test-Path -Path $descriptionPath){
+                $currentTime = now
+                Write-Host "[$currentTime]: RE uninstalling ..."
+                $msi_path = local_build_path
+                $pathCorrect = Test-Path -Path $msi_path
+                if(-not $pathCorrect){
+                    Write-Host "[$currentTime]: MSI path is not correct $msi_path" -ForegroundColor Red
+                     -ForegroundColor Red
+                }
+                Write-Host "[$currentTime]: MSI to uninstall: " $msi_path
+                $arguments = "/x `"$msi_path`" /quiet"
+                Start-Process msiexec.exe -ArgumentList $arguments -Wait -Verb RunAs -ErrorAction Stop
+                Write-Host "[$currentTime]: RE uninstalling complete "
+            }
+        }
+        catch{Write-Host "[$currentTime]: Risk Explorer not uninstalled"}
+}
+
+function kill_re_process(){
+    try{
+            Write-Host "[$currentTime]: Kill process 'RiskExplorer'"
+            Stop-Process -Name "RiskExplorer" -Force -ErrorAction Stop
+         }
+   catch{
+             Write-Host "No 'RiskExplorer' process to kill'"
+         }
+}
+function msi_install($path){
+   $currentTime = now
+   if( -not (check_build $path)){
+        try{
+            Write-Host "[$currentTime]: Kill process 'RiskExplorer'"
+            Stop-Process -Name "RiskExplorer" -Force -ErrorAction Stop
+         }
+         catch{
+             Write-Host "No 'RiskExplorer' process to kill'"
+         }
+        msi_uninstall_local $path
+        Write-Host "[$currentTime]: RE installing ..."
+        $arguments = "/i `"$path`" /quiet"
+        Start-Process msiexec.exe -ArgumentList $arguments -Wait -Verb RunAs
+        Write-Host "[$currentTime]: Installation completed"
+        Start-Process "D:\ayelagin\MUA\URS-Test\PowerShell\SetDistrSimServer.bat" -Verb RunAs
+   }
+   else{  Write-Host "[$currentTime]: --- Necessary build has already installed ---"; return $true }
+}
+function quick_edit_mode ($vm, $user){
+    #Write-Host "user: $user" "vm: $vm"
+    if($user -eq "tester"){
+        $pass = "123"
+    }
+    else{
+        $pass = "111"
+    }
+    psexec \\$vm -u $user -p $pass -i 1 -d -nobanner "C:\edit_quick_mode.bat" 
+    #Write-Host "error[0]: " $Error[0]
+    $lastError = $Error[0].ToString()
+    if($lastError.StartsWith("PsExec could not start")) {
+       #Write-Host "2222" -ForegroundColor Green
+       psexec \\$vm -u $user -p $pass -i 2 -d -nobanner "C:\edit_quick_mode.bat" 
+    }
+}
+#run_powershell_client2_agent_v2
+function kill_process_remote ($vm){
+    #Write-Host "kill_process_remote for $vm" -ForegroundColor Yellow
+    pskill \\$vm -u TESTDC.URS\tester -p A123456 -nobanner cmd.exe 
+    pskill \\$vm -u TESTDC.URS\tester -p A123456 -nobanner conhost
+    pskill \\$vm -u TESTDC.URS\tester -p A123456 -nobanner powershell
+    pskill \\$vm -u TESTDC.URS\tester -p A123456 -nobanner RiskExplorer 
+    #sleep 3
+    #Write-Host "End kill_process_remote for $vm" -ForegroundColor Yellow
+}
+function run_bot_as_user ($vm, $user){
+    #write-host "run_bot_as_user: $vm, $user"
+    if($user -eq "tester"){
+        $pass = "A123456"
+    } else{
+        $pass = "111"
+    }
+    #psexec \\$vm -u TESTDC.URS\$user -p 111 -i 2 -d "C:\Users\tester.TESTDC\Desktop\run_powershell_client2_agent_v2.bat"
+    psexec \\$vm -u TESTDC.URS\$user -p $pass -i 1 -d -nobanner "C:\run_client2_agent.bat" 
+    #Write-Host "error[0]: " $Error[0]
+    $lastError = $Error[0].ToString()
+    if($lastError.StartsWith("PsExec could not start")) {
+       #Write-Host "2222" -ForegroundColor Green
+       psexec \\$vm -u TESTDC.URS\$user -p $pass -i 2 -d -nobanner "C:\run_client2_agent.bat"
+    }
+}
+function restart_server_bot($table, $vm="mua_socket"){
+    $user = "tester"
+    $pass = 123
+    pskill \\$vm -u $user -p $pass -nobanner powershell
+    pskill \\$vm -u $user -p $pass -nobanner cmd.exe 
+    pskill \\$vm -u $user -p $pass -nobanner conhost.exe 
+}
+function start_server_bot($table){
+    #Run server bot here with 'server' table name as parameter
+    $vm="mua_socket"
+    $user = "tester"
+    $pass = 123
+    psexec \\$vm -u $user -p $pass -i 1 -d -nobanner "C:\run_socket_server.bat" $table 
+    $lastError = $Error[0].ToString()
+    if($lastError.StartsWith("PsExec could not start")) {
+      psexec \\$vm -u $user -p $pass -i 2 -d -nobanner "C:\run_socket_server.bat" $table 
+    }
+}
+
+function kill_pid($vm){
+    if($showLog){
+        write-host "kill_pid start"
+    }
+    $user = "tester"
+    $pass = 123
+    psexec \\$vm -u $user -p $pass -i 1 -d  "C:\kill_pid.bat" -nobanner
+    $lastError = $Error[0].ToString()
+    if($lastError.StartsWith("PsExec could not start")) {
+       psexec \\$vm -u $user -p $pass -i 2 -d  "C:\kill_pid.bat" -nobanner
+    }
+    if($showLog){
+        write-host "kill_pid end"
+    }
+}
+
+function kill_process_contains($str, $name="'python.exe'"){
+    $vm="mua_socket"
+    $user = "tester"
+    $pass = 123
+    #write-host "Kill process contains: " $str -BackgroundColor Green
+    psexec \\$vm -u $user -p $pass -i 1 -d -nobanner "C:\kill_process_contains.bat" $str 
+    $lastError = $Error[0].ToString()
+    if($lastError.StartsWith("PsExec could not start")) {
+      psexec \\$vm -u $user -p $pass -i 2 -d -nobanner "C:\kill_process_contains.bat" $str
+    }
+}
+#$init_job = {
+    function job(){
+        foreach($server in $serversList){
+            $id_list = run-sql $get_id_query '0' $server
+            #write-host "id_list: $id_list"
+            foreach ($id in $id_list){
+                #write-host "id: $id"
+                #write-host "status: $status"
+                $status = run-sql $get_status_query $id $server
+                if ($status.StartsWith("new")){
+                    if($dictServerStatus[$server] -eq $false){
+                        start_server_bot $server
+                        $dictServerStatus[$server]=$true
+                        $date = now
+                        Write-Host "[$date]: $server is running: " $dictServerStatus[$server] -ForegroundColor Green
+                        #update_repository $revision
+                        $hostNameClient1 = run-sql $get_host_name $id $server
+                        $serverName = run-sql $get_server_name $id $server
+                        $scriptName = run-sql $get_script_name_query $id $server
+                        $LogPath = "C:\Users\Administrator\Documents\Log-" + $LogDate + $scriptName + ".txt"
+                        Log-Message $LogPath "Status for $server : $status"
+                        $totalClients = run-sql $get_total_clients $id $server
+                        #$revision = run-sql $get_revision_query $id $server
+                        $repoURL = run-sql $get_url $id $server
+                        $buildPath = run-sql $get_build_path $id $server
+                        $file = $scriptName.Replace(".", "--")
+                        $port = run-sql $get_port $id $server
+                        if ($scriptName -eq "scripts.master.admin_and_actuaries.3users.3_users_client-test_10"){
+                            write-host "||||||||||||   RE should be installed  ||||||||||" -ForegroundColor Green
+                            msi_install $buildPath
+                            #python "D:\ayelagin\MUA\URS-Test\run-tests.py" --run-test 'scripts.master.admin_and_actuaries.3users.special' 'distributed_simulations'
+                        }
+
+                        $InfoPath = create_info_file $file.ToString()
+                        #$Info = $Info.Split(" ")[0]
+                        #Write-host "[$date]: File created is: \'$InfoPath\'" -ForegroundColor Yellow
+                        #msi_install $buildPath
+                        #Write-Host "[$date]: totalClients: " $totalClients -ForegroundColor Green
+                        $clients = @()
+                        $clients = vm_select2($totalClients)
+                        if($clients){
+                            run-sql $change_status_query $id $server 'toRun'
+                            Log-Message $LogPath "change status to 'toRun' in $server"
+                            Write-Host  "[$date]: DOMAIN16 change status to 'toRun' in $server" -ForegroundColor Green
+                            foreach ($i in 1..($totalClients)){
+                                #Write-Host "i= " $i
+                                $date = now
+                                #Write-Host  "[$date]: Selected client:" $clients[($i-1).ToString()] -ForegroundColor Green
+                                insert_used_client "used_clients" $insert_client_query $scriptName $clients[($i-1).ToString()] $date
+                                $time = run-sql $get_time_query $id $server
+                                #write-host "--- Time: $time ---"
+                                $clientU = "client"+($i)
+                                #Write-Host "clientU: " $clientU
+                                $user = run-sql $get_user_query $id $server $clientU
+                                if($user -ne "tester"){
+                                    #write-host "User is: " $user
+                                    kill_process_remote $clients[($i-1).ToString()]
+                                    run_bot_as_user $clients[($i-1).ToString()] $user
+                                    $clientsToKillCMD.Add($clients[($i-1).ToString()])
+                                }
+                                else{
+                                    $user = "tester"
+                                    #write-host "User is: tester"
+                                    kill_process_remote $clients[($i-1).ToString()]
+                                    run_bot_as_user $clients[($i-1).ToString()] $user
+                                }
+                                add_content $InfoPath $clients[($i-1).ToString()]
+                                if($i -eq $totalClients){
+                                    add_content $InfoPath "finish"
+                                }
+                                run-sql-insert $clients[($i-1).ToString()] $insert_into_table $totalClients $serverName $scriptName 'new' $revision $repoURL $buildPath ($i) $time $port
+                                #write_to_file $hostNameClient2 $needMachines $hostNameServer $scriptName "new" $revision $url $buildPath ($i+1) $time
+                                }
+                          }
+                        else{
+                            Log-Message $LogPath "Can't find $totalClients for $scriptName"
+                        }
+                  }
+                  else{
+                    Log-Message $LogPath "Status for $server : $status"
+                    Log-Message $LogPath $dictServerStatus[$server]
+                    Log-Message $LogPath " `r`n "
+                    }
+                  }
+
+                
+             }
+        }
+    }
+#}
+function now(){
+    $nowDateTime = (Get-Date -Format "MM/dd/yyyy HH:mm")
+    $convertTimeZone = [System.TimeZoneInfo]::ConvertTimeBySystemTimeZoneId([datetime]$nowDateTime,"FLE Standard Time")
+    $currentTime=$convertTimeZone.ToString("MM/dd/yyyy HH:mm")
+    return $currentTime
+}
+
+#change status "running" to "toDelete" if script working too long in clients
+function client-change-old-status(){
+    foreach($client in $clientsList){
+        $id_list = run-sql $get_id_query '0' $client
+        foreach ($id in $id_list){
+            $status = run-sql $get_status_query $id $client
+            if($status -eq 'running'){
+                #write-host "Find 'running' status"
+                $timeDB = run-sql $get_time_query $id $client
+                $currentTime= now
+                $timeDiff=([datetime]$currentTime - [datetime]$timeDB).Minutes
+                #write-host "timeDiff: $timeDiff"
+                if($timeDiff -cge $global:timeOut ){
+                    #write-host "now: " $currentTime
+                    run-sql $change_status_query $id $client 'toDelete'
+                    Write-Host "[$currentTime]: 'running' status replace to 'toDelete' in client " $client
+                }
+            }
+       }
+    }
+}
+
+
+
+#$init2 = {
+    #change status "running" to "toDelete" if script working too long in server-vm
+    function server-change-old-status(){
+        foreach($server in $serversList){
+            #Write-Host $file
+            $id_list = run-sql $get_id_query '0' $server
+            foreach ($id in $id_list){
+                $status = run-sql $get_status_query $id $server
+                #write-host $status -ForegroundColor Blue
+                if($status.StartsWith('running')){
+                    #write-host "Find 'running' status"
+                    $timeDB = run-sql $get_time_query $id $server
+                    $nowDateTime = (Get-Date -Format "MM/dd/yyyy HH:mm")
+                    $convertTimeZone = [System.TimeZoneInfo]::ConvertTimeBySystemTimeZoneId([datetime]$nowDateTime,"FLE Standard Time")
+                    $currentTime=$convertTimeZone.ToString("MM/dd/yyyy HH:mm")
+                    $timeDiff=([datetime]$currentTime - [datetime]$timeDB).Minutes
+                    if($timeDiff -cge $global:timeOut ){
+                        Write-Host "Global timeout triggered in server-change-old-status" -BackgroundColor Red
+                        run-sql $change_status_query $id $server 'toDelete'
+                        Write-Host "[$currentTime]: 'running' status replace to 'toDelete' in server " $server
+                    }
+                }
+                if($status.StartsWith('toRun') -or $status.StartsWith('new')){
+                    #write-host "Find 'toRun' status"
+                    $timeDB = run-sql $get_time_query $id $server
+                    $nowDateTime = (Get-Date -Format "MM/dd/yyyy HH:mm")
+                    $convertTimeZone = [System.TimeZoneInfo]::ConvertTimeBySystemTimeZoneId([datetime]$nowDateTime,"FLE Standard Time")
+                    $currentTime=$convertTimeZone.ToString("MM/dd/yyyy HH:mm")
+                    $timeDiff=([datetime]$currentTime - [datetime]$timeDB).Minutes
+                    if($timeDiff -cge $global:timeOut+5 ){
+                        Write-Host "Global timeout triggered in server-change-old-status" -BackgroundColor Red
+                        run-sql $change_status_query $id $server 'toDelete'
+                        Write-Host "[$currentTime]: '$status' status replace to 'toDelete' in server " $server
+                    }
+                }
+           }
+        }
+    }
+#}
+#remove row if status is "toDelete" in client
+function client-remove-job(){
+        foreach($client in $clientsList){
+            $id_list = run-sql $get_id_query '0' $client
+            foreach ($id in $id_list){
+                $status = run-sql $get_status_query $id $client
+                if($status -eq 'toDelete'){
+                    run-sql $delete_rec_query $id $client
+                    $date = now
+                    Write-Host "[$date]: 'toDelete' status was removed from client: " $client
+                    }
+                }
+       }
+}
+$init_server_remove = {
+  Import-Module .\PowerShell\Functions.ps1
+  #Param($dictServerStatus)
+  Write-Host "init_server_remove"
+  $LogDate = (Get-Date).tostring("yyyyMMdd-HH-mm-ss")
+  $LogPath = "C:\Users\Administrator\Documents\LogFromRemove-" + $LogDate + ".txt"
+
+  function server-remove-job{
+  Write-Host "Block"
+    Write-Host "dictServerStatus = " ($using:dictServerStatus)["server1"]
+    $user = "tester"
+    $pass = 123
+    while($true){
+      Log-Message $LogPath "Start server-remove-job"
+      #Log-Message $LogPath "List $servers"
+      try{
+        foreach($server in $servers){
+          #Log-Message $LogPath "$server"
+          $id_list = run-sql $get_id_query '0' $server
+          foreach ($id in $id_list){
+            $status = run-sql $get_status_query $id $server
+            if($status -eq 'toDelete'){
+                #$date = now
+                Log-Message $LogPath "'toDelete' status was find in:  $server"
+                #$dictServerStatus[$server] = $false
+                $port = run-sql $get_port $id $server
+                Write-Host "port: $port"
+                kill_process_contains $server
+                kill_process_contains $port
+                run-sql $update_rec_query $id $server
+                #Write-Host "[$date]:  'toDelete' status was removed from server: " $server
+                Log-Message $LogPath "'toDelete' status was removed from server:  $server"
+                }
+            }
+        }
+        Log-Message $LogPath "End server-remove-job"
+        sleep 5
+        Log-Message $LogPath "### Sleep for sec in server-remove-job `r`n"
+      }
+      catch{
+        Log-Message $LogPath "Error: $_.Exception.Message"
+        sleep 2
+      }
+    }
+  }
+}
+
+function server-remove-job(){
+    $user = "tester"
+    $pass = 123
+    foreach($server in $serversList){
+        $id_list = run-sql $get_id_query '0' $server
+        foreach ($id in $id_list){
+            $scriptName = run-sql $get_script_name_query $id $server
+            if($scriptName){
+                $status = run-sql $get_status_query $id $server
+                $port = run-sql $get_port $id $server
+                if($status -eq 'toDelete'){
+                    $date = now
+                    $dictServerStatus[$server] = $false
+                    $port = run-sql $get_port $id $server
+                    #kill_process_contains $server
+                    #kill_process_contains $port
+                    run-sql $update_rec_query $id $server
+                    Write-Host "[$date]: 'toDelete' status was removed from server: " $server
+                }
+            }
+
+        }
+    }
+}
+function kill_cmd_remote(){
+    # Function need to find RE window during script
+    #write-host $clientsToKillCMD -ForegroundColor Red
+    $date = now
+    $tempList = new-object 'System.Collections.Generic.List[string]'
+    foreach ($client in $clientsToKillCMD){
+        $date = now
+        $id_list = run-sql $get_id_query '0' $client
+        #write-host "id_list: " $id_list
+        #write-host "tempList: " $tempList
+        if(! $id_list) {
+            $tempList.Add($client)
+            continue
+           }
+        foreach ($id in $id_list){
+            #Write-Host $client -BackgroundColor Yellow
+            $status = run-sql $get_status_query $id $client
+            #write-host "status:" $status
+            if($status -eq 'running'){
+                #Write-Host $client -BackgroundColor Yellow
+                $timeDB = run-sql $get_time_query $id $client
+                $nowDateTime = (Get-Date -Format "MM/dd/yyyy HH:mm:ss")
+                $convertTimeZone = [System.TimeZoneInfo]::ConvertTimeBySystemTimeZoneId([datetime]$nowDateTime,"FLE Standard Time")
+                $currentTime=$convertTimeZone.ToString("MM/dd/yyyy HH:mm:ss")
+                $timeDiff=([datetime]$currentTime - [datetime]$timeDB).Seconds
+                #write-host "timeDB:      " $timeDB -ForegroundColor Yellow
+                #write-host "currentTime: " $currentTime -ForegroundColor Yellow
+                #write-host "timeDiff:    " $timeDiff -ForegroundColor Yellow
+                if($timeDiff -ge 40 ){
+                    #Write-Host "[$date]: Start Killing CMD in $client" -BackgroundColor DarkMagenta
+                    try {
+                        pskill \\$client -u TESTDC.URS\tester -p -nobanner A123456 cmd.exe 
+                        write-host "--- cmd killed in $client ---"
+                        }
+                    catch{
+                        write-host "[$date]: Cannot kill cmd in $client"
+                        $tempList.Add($client)
+                        continue
+
+                        }
+                    $tempList.Add($client)
+                    #Write-Host "[$date]: Killed CMD in $client" -BackgroundColor DarkMagenta
+                }
+             }
+         if(! $status){
+            write-host "[$date]: No 'running' job in $client. Should be deleted from clientsToKillCMD" -ForegroundColor Red
+            $tempList.Add($client)
+            break
+         }
+         }
+         #write-host "Current client: $client"
+         #write-host "sleep 1 sec in kill_cmd_remote"
+         #sleep 1
+    }
+    foreach ($client in $tempList){
+        $clientsToKillCMD.Remove($client)
+        write-host "[$date]: $client removed from clientsToKillCMD"
+    }
+    #write-host "[$date]: 'kill_cmd_remote' finished"
+}
+
+function create_info_file($fileName){
+    $fileName = $fileName.ToString() +".txt"
+    $filePath = (Join-Path -Path $info_path -ChildPath $fileName).ToString()
+    #$filePath = $info_path.ToString() + $fileName.ToString()
+    #If the file does not exist, create it.
+    if (-not(Test-Path -Path $filePath -PathType Leaf)) {
+         try {
+             $temp = New-Item -ItemType File -Path $filePath -Force -ErrorAction Stop
+             #Write-Host "The file [$filePath] has been created."
+         }
+         catch {
+             throw $_.Exception.Message
+         }
+     }
+    # If the file already exists, show the message and do nothing.
+     else {
+         Write-Host "Cannot create [$filePath] because a file with that name already exists."
+         Clear-Content $filePath
+     }
+     #Write-Host "Returning from create_info_file" $filePath -ForegroundColor Yellow
+     return $filePath
+}
+function add_content($fileName, $content){
+    $content | Out-File $fileName -Append
+    #Add-Content $fileName $content
+}
+
+
+#$init = {
+  #change status "running" to "toDelete" if script working too long in clients and servers
+  function change-all-old-status(){
+    foreach($client in $clientsList){
+        $id_list = run-sql $get_id_query '0' $client
+        foreach ($id in $id_list){
+            $status = run-sql $get_status_query $id $client
+            $timeDB = run-sql $get_time_query $id $client
+            $currentTime= now
+            $timeDiff=([datetime]$currentTime - [datetime]$timeDB).Minutes
+            #write-host "timeDiff: $timeDiff"
+            if($timeDiff -cge $global:timeOut ){
+                #write-host "now: " $currentTime
+                run-sql $change_status_query $id $client 'toDelete'
+                Write-Host "[$currentTime]: $status status replace to 'toDelete' in client " $client
+                }
+          }
+      }
+
+    foreach($server in $serversList){
+        $id_list = run-sql $get_id_query '0' $server
+        foreach ($id in $id_list){
+            $scriptName = run-sql $get_script_name_query $id $server
+            if($scriptName){
+                $status = run-sql $get_status_query $id $server
+                $timeDB = run-sql $get_time_query $id $server
+                $currentTime= now
+                $timeDiff=([datetime]$currentTime - [datetime]$timeDB).Minutes
+                #write-host "timeDiff: $timeDiff"
+                if($timeDiff -cge $global:timeOut ){
+                    #write-host "now: " $currentTime
+                    Write-Host "Global timeout triggered in change-all-old-status" -BackgroundColor Red
+                    run-sql $change_status_query $id $server 'toDelete'
+                    Write-Host "[$currentTime]: $status status replace to 'toDelete' in server " $server
+                }
+            }
+       }
+    }
+}
+
+#start-threadjob -Name "ServerRemoveJob" -ScriptBlock {$using:dictServerStatus; server-remove-job } <#-ArgumentList ($dictServerStatus)#> -StreamingHost $Host -InitializationScript $init_server_remove |Receive-Job
+#Stop-Job -Name "ServerRemoveJob"
+kill_pid "mua_socket"
+update_repository $revision
+while(1){
+    #$date = now
+    #write-host "[$date]: ====== Parsing tables... ======"
+    #Log-Message $LogPath "Start change-all-old-status"
+    change-all-old-status
+    #Log-Message $LogPath "End change-all-old-status"
+
+    #Log-Message $LogPath "Start server-change-old-status"
+    server-change-old-status
+    #Log-Message $LogPath "End server-change-old-status"
+
+    #Log-Message $LogPath "Start client-change-old-status"
+    client-change-old-status
+    #Log-Message $LogPath "End client-change-old-status"
+
+    #Log-Message $LogPath "Start server-remove-job"
+    server-remove-job
+    #Log-Message $LogPath "End server-remove-job"
+
+    #Log-Message $LogPath "Start client-remove-job"
+    client-remove-job
+    #Log-Message $LogPath "End client-remove-job"
+
+    #Log-Message $LogPath "Start job"
+    job
+    #Log-Message $LogPath "End job"
+
+    #Log-Message $LogPath "Start change-all-old-status"
+    kill_cmd_remote
+    #Log-Message $LogPath "End kill_cmd_remote"
+
+    #Log-Message $LogPath "Sleep for 5 sec `r`n"
+    sleep 5
+}
+
+
+
+#run-sql-insert "mua_client2_4" $insert_into_table "4" '12121' "scriptName" 'delete' "revision" "1212" "buildPath" "i+1" "time"
+#write_to_file $hostNameClient2 $needMachines $hostNameServer $scriptName "new" $revision $url $buildPath ($i+1) $time
+#$vm = 'mclient2_1'
+#$user = 'TESTDC\tester'
+#$pass = 'A123456'
+#run_bot_as_user $vm $user
+#quick_edit_mode $vm $user
+#psexec \\$vm -u $user -p $pass -i 1 -d "C:\run_ps.bat" -nobanner
+#pskill \\$vm -u $user -p $pass cmd.exe -nobanner
+ #pskill \\$client -u TESTDC.URS\tester -p A123456 cmd.exe -nobanner
+#$server = "mua_server1"
+#kill_pid $server
+#$vm = "mua_client2_19"
+#$user = "prj_administrator"
+#run_bot_as_user $vm
+#$user = "tester"
+#$pass = 123
+#start_server_bot "mua_server8"
+#kill_process_contains "mua_server2"
+#start_server_bot $server
+#$path = "\\file-server\URS Application Studio Setup\Version 12\x64\URSApplicationStudio-12-0-0(4254)-64bit.msi"
+#msi_uninstall_local $path
+#insert_used_client "used_clients" $insert_client_query "scriptName" "client2_20" $date
+#pskill \\$vm -u TESTDC.URS\tester -p A123456 cmd.exe run_powershell_server_agent_v3 run_powershell_server_agent_v3
+#$vm = "mua_socket"
+#$user = 'tester'
+#$pass = 123
+#$table = "mua_server1"
+#psexec \\$vm -u $user -p $pass -i 1 -d "C:\run_test.bat" $table
+#$server = "mua_server8"
+#$id = 4882
+#run-sql $update_rec_query $id $server
