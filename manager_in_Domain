@@ -839,7 +839,7 @@ while(1){
     #Log-Message $LogPath "End client-remove-job"
 
     #Log-Message $LogPath "Start job"
-    job
+    Start-Job -Name "JOB" -ScriptBlock { job } | Out-Null
     #Log-Message $LogPath "End job"
 
     #Log-Message $LogPath "Start change-all-old-status"
