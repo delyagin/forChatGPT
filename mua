@@ -1,0 +1,921 @@
+from library import *
+from library import do
+from library import db
+from library import change
+from library.risk_explorer import RE
+import os
+import operator
+import time
+import socket
+import sys
+from datetime import datetime
+import pyodbc
+import traceback
+import win32api
+import win32net
+from scripts.master import prebase
+from shutil import copyfile
+from library import urs
+import re
+
+username = 'Administrator'
+password = 'Ultifit9'
+
+SCRIPT_RUNNING_TIMEOUT = 360
+SERVER = r"DRIVER=SQL Server;SERVER=SQLVM\SQL;Database=MUA-DB;UID=Tester;PWD=12345;"
+servers = []
+clients = []
+client1_path = r"\\DOMAIN16\MUA\CLIENT_1"
+get_tables = "SELECT TABLE_NAME FROM [MUA-DB].INFORMATION_SCHEMA.TABLES"
+PATH_TEMP_VP = r"\\DOMAIN16\MUA\temp_vp"
+info_path = r"\\DOMAIN16\MUA\info"
+rex_path = r"\\DOMAIN16\MUA\REX"
+rex_copy_base = r"\\DOMAIN16\MUA\rex_copy_for_base"
+rex_copy_manager = r"\\DOMAIN16\MUA\rex_copy_for_manager"
+stage_rex_path = r"\\DOMAIN16\MUA\temp_stage_rex"
+MIN_PORT = 9800
+MAX_PORT = 9999
+
+def init_list():
+    tables = db.run_sql_all(get_tables)
+    for table in tables:
+        if (table[0].startswith('mua_server')):
+            servers.append(table[0])
+        elif (table[0].startswith('mclient')):
+            clients.append(table[0])
+
+def now():
+    return datetime.now().strftime("%H:%M")
+
+def date_now():
+    temp = datetime.now().strftime("%m/%d/%Y %H:%M")
+    date = datetime.strptime(temp, "%m/%d/%Y %H:%M")
+    return date
+
+def choose_server(script):
+    # init_list()
+    temp_server = None
+    while True:
+        for server in servers:
+            if not db.get_script_from_server(server):
+                db.update_script(server, script)
+                temp_server = server
+                break
+        if temp_server:
+            if db.get_script_from_server(temp_server) == script:
+                print(f"Find server: {temp_server}")
+                return temp_server
+            else:
+                temp_server = None
+        print("Finding server...")
+
+
+def table_rows():
+    init_list()
+    statistics = {}
+    for server in servers:
+        rows = db.row_number(server)
+        statistics[server] = rows
+    for client in clients:
+        rows = db.row_number(client)
+        statistics[client] = rows
+    return statistics
+
+def server_name_from_table(script_name):
+    # init_list()
+    self_host_name = socket.gethostname()
+    print("host_name: ", self_host_name)
+    server = None
+    attempts = 5
+    sql = "SELECT server_name FROM {} WHERE script_name=? AND status=?".format(self_host_name)
+    values = (script_name, 'running')
+    for i in range(attempts):
+        log.info("{}".format("Finding server..."))
+        print("script_name:", script_name)
+        print("self_host_name:", self_host_name)
+        server = db.run_sql(sql, values)
+        print("Status: ", get_status(script_name, server))
+        if (server):
+            log.info("Server was found: {}".format(server))
+            break
+        else:
+            print("Sleep 5 sec")
+            time.sleep(5)
+    return server
+
+def get_script(host=socket.gethostname()):
+    script = ""
+    table = host
+    sql = "SELECT script_name FROM [{}]".format(table)
+    script = db.run_sql(sql)
+    log.info("script from get_script: {}".format(script))
+    log.info("host from get_script: {}".format(host))
+    return script
+
+def get_error(script, server):
+    # print(script)
+    # print(server)
+    sql = "SELECT error FROM {} WHERE script_name=?".format(server)
+    values = (script)
+    error = db.run_sql(sql, values)
+    return error
+
+def set_error(script, error):
+    init_list()
+    server_name = None
+    for server in servers:
+        if get_status(script, server):
+            server_name = server
+            break
+    if server_name:
+        sql = "UPDATE {} SET error = ? WHERE script_name=?".format(server_name)
+        values = (error, script)
+        db.run_sql(sql, values)
+        print(f"Update error in table: {server_name}")
+    else:
+        log.error("--- Can't set error for '{}' script. Can't find server with this script ---".format(script))
+
+def get_status(script, server):
+    sql = "SELECT status FROM {} WHERE script_name=?".format(server)
+    values = (script)
+    status = db.run_sql(sql, script)
+    try:
+        status = db.run_sql(sql, script)
+        return status
+    except:
+        log.error("--- 'get_status' function return status 'None' ---")
+        return None
+
+def get_rex_status(build, table):
+    sql = "SELECT status FROM {} WHERE build=?".format(table)
+    values = (build)
+    status = db.run_sql(sql, build)
+    return status
+
+def wait_clients_done(script, server):
+    """ Wait until all clients finished own scrips """
+    status = get_status(script, server)
+    timer = 0
+    print("Wait until clients done...")
+    while(status != "done" and timer < 1000):
+        time.sleep(1)
+        timer += 1
+        status = get_status(script, server)
+        if not status:
+            return f"Script crashed but socket server not write any info about it after {timer} sec"
+        # print(timer, end=", ")
+    if timer >= 1000:
+        log.info("--- Time is reached ---")
+        return "Time is reached"
+    error = get_error(script, server)
+    log.info(f"Error in wait_clients_done: {error} in {server}, {script}")
+    return error
+
+def read_file_from_client1(host_name, path=None):
+    if not path:
+        clients = os.listdir(client1_path)
+        data = None
+        for client in clients:
+            if (host_name == client.split(".")[0]):
+                file=client1_path+"\\"+client
+                with open(file, "r") as f:
+                    data = f.read()
+                # if (data):
+                #     os.remove(file)
+    else:
+        file=path
+        with open(file, "r") as f:
+            data = f.read()
+    return data
+
+# def check_server_status(server_name, script_name):
+#     sql = "SELECT status FROM {} WHERE script_name=?".format(server_name)
+#     status = db.run_sql(sql, script_name)
+#     if (status):
+#         if(status == "running"):
+#             print("Server is READY. Status: {}".format(status))
+#             return True
+#         else:
+#             print("Server is NOT READY. Status: {}".format(status))
+#             return False
+#     else:
+#         print("--- Can't find {} in {} ---".format(script_name, server_name))
+
+def create_job(script_name, total_clients, build, client1, client2, client3, client4, status="new", error="noError"):
+    init_list()
+    value_check = True
+    server_name = choose_server(script_name)
+    vm_name = socket.gethostname()
+    port = give_port()
+    print("--- port: {} ---".format(port))
+    # if build:
+    #     build_path = r"\\file-server\URS Application Studio Setup\Version 12\x64\URSApplicationStudio-12-0-0("+build+")-64bit.msi"
+    #     print(build_path)
+    #     data = ["MUA","http://testreposerver/URS-Test/", build_path]
+    # else:
+    data = read_file_from_client1(vm_name)
+    if(data):
+        data = data.replace("\n", "")
+        data = data.split('\t')
+    else:
+        raise Exception("Testbot-Agent does not write any info to CLIENT_1 file")
+    start_time = datetime.now().strftime("%m/%d/%Y %H:%M:%S")
+    info=[vm_name, total_clients, status]
+    data.append(start_time)
+    clients = [client1, client2, client3, client4, error, port]
+    data.extend(clients)
+    info.extend(data)
+    # query_port = "INSERT INTO {} (port, date) VALUES (?,?)".format("ports")
+    # val = (port, start_time)
+    # db.run_sql(query_port, val)
+    db.insert_port(port)
+    # print(info[0]) ,client1,client2,client3,client4 ,info[9],info[10],info[11],info[12]
+    # sql = "INSERT INTO {} (vm_name,server_name,script_name,total_clients,status,revision,repository,build_path,[time],client1,client2,client3,client4,error,port) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)".format(server_name)
+    # sql = "UPDATE {} SET vm_name=?,total_clients=?,status=?,revision=?,repository=?,build_path=?,[time]=?,client1=?,client2=?,client3=?,client4=?,error=?,port=?) WHERE server_name=?".format(server_name)
+    sql = "UPDATE {} SET vm_name=?,total_clients=?,status=?,revision=?,repository=?,build_path=?,[time]=?,client1=?,client2=?,client3=?,client4=?,error=?,port=? WHERE server_name=?".format(server_name)
+    for value in info:
+        if value is None:
+            value_check=False
+            break
+    print(info)
+    if(value_check):
+        values = (info[0],info[1],info[2],info[3],info[4],info[5],info[6],info[7],info[8],info[9],info[10],info[11],info[12],server_name)
+        success_job = db.run_sql(sql, values)
+        print(success_job)
+        if(not success_job):
+            raise Exception("Cannot write job to server")
+        print("Write job to {}".format(server_name))
+        server_status = False
+        start_test = time.time()
+        while server_status != "running":
+            server_status = db.server_status(server_name, script_name)
+            time_diff = time.time() - start_test
+            if(server_status == "done" or server_status == "toDelete"):
+                table_stat = table_rows()
+                for s in table_stat:
+                    sql = "SELECT script_name FROM [{}] ".format(s)
+                    tscript = db.run_sql(sql)
+                    if tscript is not None:
+                        status = db.get_status(tscript, s)
+                        time = db.get_time(tscript, s)
+                    else:
+                        status = None
+                        time = None
+                    log.info(f"{s} : {table_stat[s]} {tscript} {status}")
+                log.info(f"Server status {server_status} for {script_name}")
+                raise Exception("[{}]: --- {} has not started and stopped work ---".format(now(), server_name))
+            if (time_diff > SCRIPT_RUNNING_TIMEOUT):
+                log.info("start_test time: ", start_test)
+                log.info("time.time(): ", time.time())
+                log.info("diff: ", time_diff)
+                # sys.exit("Client-1 cannot find running server for {} script".format(script_name))
+                table_stat = table_rows()
+                for s in table_stat:
+                    sql = "SELECT script_name FROM [{}] ".format(s)
+                    tscript = db.run_sql(sql)
+                    if tscript is not None:
+                        status = db.get_status(tscript, s)
+                        time = db.get_time(tscript, s)
+                    else:
+                        status = None
+                        time = None
+                    log.info(f"{s} : {table_stat[s]} {tscript} {status}")
+                raise Exception(f"{server_name} not running and still '{status}' after {time_diff} sec")
+            else:
+                log.info("{}: Wait for the {} to start. Status is {}".format(now(), server_name, server_status))
+
+                time.sleep(3)
+        log.info("[{}]: {} is running now".format(now(), server_name))
+        return server_name
+    else:
+        log.error("Some value in Info is None")
+
+class SocketGuard:
+    def __init__(self, socket):
+        self.sock = socket
+    def __del__(self):
+        self.sock.close()
+
+def client(port, server_name, step, list_function, kill_re, client_number=2):
+    # log.info("--- step={} ---".format(step))
+    if(server_name is None):
+        raise Exception("Could not find server")
+    steps = len(list_function)
+    HOST, PORT = server_name, port
+    # log.info("HOST: {}, PORT: {} ".format(HOST, PORT))
+    data = "Client-" + str(client_number)
+    # Create a socket (SOCK_STREAM means a TCP socket)
+    # with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(40) # operations will raise a timeout exception if the timeout period value has elapsed before the operation has completed
+    sock.connect((HOST, PORT))
+    try:
+        guard = SocketGuard(sock) # When object will bee destryed socket will closed
+        print("[{}]: ---------- Current step: {} ----------".format(now(),step))
+        if(step == steps+1):
+            message = data+" finished. All steps done. Stop server@"
+            print("[{}]: Sent to server:     {}".format(now(), message))
+            sock.sendall(message.encode())
+            step += 1
+            sock.close()
+            return step
+        sock.sendall(bytes(data + " ready@", "utf-8"))
+        # log.info("[{}]: Sent to server:       {}".format(now(), data+" ready"))
+        # Receive data from the server and shut down
+        received = str(sock.recv(1024), "utf-8")
+        # log.info("[{}]: Receive from server:  {}".format(now(), received))
+        if(received == str(data + ' do step {}'.format(step))):
+            print("[{}]: Run step {} on {}".format(now(), step, data))
+            message = "{} got the job@".format(data)
+            bmessage = message.encode()
+            sock.sendall(bmessage)
+            # log.info("[{}]: Send to server {}".format(now(), message))
+            try:
+                list_function[step-1]() #calls step-func
+                message = "{} done step {}@".format(data, step)
+                bmessage = message.encode()
+                sock.sendall(bmessage)
+                log.info("[{}]: Sent to server:     {}".format(now(), bmessage))
+                try:
+                    received = str(sock.recv(1024), "utf-8")
+                except socket.timeout as e:
+                    log.error("Server not answered during 5 sec")
+                    sys.exit(1)
+                if received == message[:-1]:
+                    step += 1
+                    return step
+                else:
+                    log.error("--- {} not equal {} ---".format(received, message[:-1]))
+                    message = "{} got the error. Stop server. {} not equal {}@".format(data, received, message[:-1])
+                    bmessage = message.encode()
+                    sock.sendall(bmessage)
+                    log.info("[{}]: Send to server {}".format(now(), message))
+                    RE.kill()
+                    return len(list_function)+2
+            except Exception as ex:
+                log.error("[{}]: --- Exception in {} ---".format(now(), list_function[step-1].__name__))
+                log.error(str(ex))
+                set_error(script=get_script(), error=socket.gethostname() + ", " + data + " in step=" + str(step) + ": " + str(ex))
+                message = "{} got the error. Stop server@".format(data)
+                bmessage = message.encode()
+                sock.sendall(bmessage)
+                time.sleep(0.5)
+                log.info("[{}]: Send to server {}".format(now(), message))
+                if kill_re:
+                    urs.killallurs()
+                return len(list_function)+2
+        elif(received.find("Stop connection with server because") != -1):
+            log.error("[{}]: Server stopped because: {}".format(now(), received))
+            if kill_re:
+                urs.killallurs()
+            return len(list_function) + 2
+        elif(received.find("wait") != -1):
+            log.info("[{}]: Wait for other clients".format(now()))
+            message = "{} wait@".format(data)
+            sock.sendall(message.encode())
+            return step
+        else:
+            log.info("[{}]: Receive from server: {}".format(now(), received))
+            return step
+    except Exception as ex:
+        log.error("[{}]: --- Catch the exception: {} ---".format(now(), str(ex)))
+        message = "{}. {} got the error. Stop server@".format(str(ex), data)
+        bmessage = message.encode()
+        sock.sendall(bmessage)
+        time.sleep(0.5)
+        log.info("[{}]: Send to server {}".format(now(), message))
+        RE.kill()
+        set_error(script=get_script(), error=socket.gethostname() + ", " + data + " in step=" + str(step) + ": " + str(ex))
+        return len(list_function)+2
+
+def run_job2(script, function, clients: str=None):   #client1="tester", client2="tester", client3="tester", client4="tester"):
+    # update_testers_file()
+    build = build_from_file()
+    server = False
+    total_clients:str = str(len(clients))
+    d = {}
+    for i in range(4):
+        try:
+            d[f'client{i+1}'] = clients[i]
+        except:
+            d[f'client{i+1}'] = "tester"
+    server = create_job(script, total_clients, build, d['client1'], d['client2'], d['client3'], d['client4'])
+    if server:
+        file_name = script.replace(".", "--")
+        is_open = False
+        if not re.search("mua-main", socket.gethostname()):
+            print("1")
+            while(not is_open):
+                if(build):
+                    is_open = open_file(file_name)
+        error = wait_clients_done(script, server)
+        if(error == "noError"):
+            try:
+                function()
+            except Exception as ex:
+                table_stat = table_rows()
+                for s in table_stat:
+                    sql = "SELECT script_name FROM [{}] ".format(s)
+                    tscript = db.run_sql(sql)
+                    if tscript is not None:
+                        status = db.get_status(tscript, s)
+                        time = db.get_time(tscript, s)
+                    else:
+                        status = None
+                        time = None
+                    log.info(f"{s} : {table_stat[s]} {tscript} {status} {time}")
+                log.error("Script error: '{}'".format(ex))
+        else:
+            table_stat = table_rows()
+            for s in table_stat:
+                sql = "SELECT script_name FROM [{}] ".format(s)
+                tscript = db.run_sql(sql)
+                if tscript is not None:
+                    status = db.get_status(tscript, s)
+                    time = db.get_time(tscript, s)
+                else:
+                    status = None
+                    time = None
+                log.info(f"{s} : {table_stat[s]} {tscript} {status} {time}")
+            log.error("Server stopped with '{}'".format(error))
+        query = "UPDATE {} SET status = ? WHERE script_name=?".format(server)
+        values = ("toDelete", script)
+        log.info(f"script: {script}, server: {server}")
+        db.run_sql(query, values)
+        log.info(f"Status changed to 'toDelete' in {server}")
+    else:
+        log.error("Cannot get server")
+
+def run_client_old(script_name, list_function, client_serial_number, kill_re=True):
+    server_name = server_name_from_table(script_name)
+    sql = "SELECT port FROM {} WHERE script_name=?".format(server_name)
+    port = db.run_sql(sql, script_name)
+    if server_name:
+        bIsDone = False
+        step = 1
+        file_name = script_name.replace(".", "--")
+        is_open = False
+        while(not bIsDone):
+            step = client_old(server_name, step, list_function, kill_re, client_serial_number)
+            if (step==len(list_function)+2):
+                bIsDone=True
+            else:
+                time.sleep(1)
+
+def run_client(script_name, list_function, client_serial_number, kill_re=True):
+    server_name = server_name_from_table(script_name)
+    sql = "SELECT port FROM {} WHERE script_name=?".format(server_name)
+    port = int(db.run_sql(sql, script_name))
+    log.info("run_client: Port: {}, server_name: {}, script_name: {}".format(port, server_name, script_name))
+    if server_name:
+        bIsDone = False
+        step = 1
+        file_name = script_name.replace(".", "--")
+        is_open = False
+        while(not bIsDone):
+            step = client(port, 'mua_socket', step, list_function, kill_re, client_serial_number)
+            if (step==len(list_function)+2):
+                bIsDone=True
+            else:
+                time.sleep(1)
+
+def check_file(file, string="finish"):
+    file_path = os.path.join(info_path, file+".txt")
+    if (os.path.exists(file_path)):
+        with open(file_path, "r", encoding="UTF16") as f:
+            data = f.read()
+        if string in data:
+            return True
+        else:
+            return False
+
+def check_repository_update(file = "ryzen02_update_repository"):
+    file_path = os.path.join(info_path, file+".txt")
+    print(file_path)
+    if (os.path.exists(file_path)):
+        with open(file_path, "r", encoding="UTF16") as f:
+            data = f.read()
+            if data == "":
+                return True
+            else:
+                return False
+
+def open_file(file):
+    if check_file(file):
+        os.startfile(os.path.join(info_path, file+".txt"))
+        return True
+    else:
+        return False
+
+def script(function, module, vm="client"):
+    """ vm = "local", "client" or "manager"
+    """
+    print("module: ", module)
+    print("function: ", function)
+    n = os.path.basename(module).split("_")[0]
+    path = os.path.dirname(module)
+    parts = path.split("\\")
+    script = ""
+    log.info(path)
+    # for part in parts:
+    #     log.info(part)
+    for i in range(len(parts)):
+        if parts[i] == "scripts":
+            start = i
+    for i in range(start, len(parts)):
+        script += parts[i] + "."
+    script += n + "_users_client" + "-" + function
+    return script
+
+def unique_name(script, index):
+    # print("unique_name script:", script)
+    name = script[8:].replace(".", "_").replace("-", "_") + "_merge" + str(index)
+    db.insert_script_vp(name)
+    return name
+
+def build_from_file(name=socket.gethostname(), path=client1_path):
+    data = do.get_from_file(name, path)
+    temp = data.split("\t")[2]
+    pattern = "(\d\d\d\d)"
+    match = re.search(pattern, temp)
+    return(match[0])
+
+def is_dlls_folder(name=socket.gethostname(), path=client1_path):
+    try:
+        data = do.get_from_file(name, path)
+    except:
+        data = do.get_from_file("rz02-mua-1", path)
+    msi_path = data.split("\t")[2]
+    if (msi_path.find("dlls") != -1):
+        return True
+    else:
+        return False
+
+def build_from_db(script):
+    server = server_name_from_table(script)
+    sql = "SELECT build_path FROM {} WHERE script_name=?".format(server)
+    values = (script)
+    data = db.run_sql(sql, script)
+    pattern = "(\d\d\d\d)"
+    match = re.search(pattern, data)
+    return(match[0])
+
+def wait_prebase_done(build, table):
+    print("Wait_prebase_done: {} {}".format(build, table))
+    status = get_rex_status(build, table)
+    while(status != "created"):
+        time.sleep(1)
+        status = get_rex_status(build, table)
+        if(status == None):
+            print("--- None ---")
+            log.error("Status is {}", status)
+            return False
+    return True
+
+def prebase_rex(prj, wait=True, re_create=False):
+    """ prj="Master" or prj="Master_adv"
+    """
+    host = socket.gethostname()
+    list = ["Master", "Master_adv"]
+    build = build_from_file()
+    print("prj = ", prj)
+    table_info = prj + "_info"
+    print(table_info)
+    name = "Master Model_adv" if len(prj.split("_")) == 2 else "Master Model"
+    if re_create:
+        db.remove_build(build, table_info)
+        remove_rex(name, build)
+    status = get_rex_status(build, table_info)
+    print("{} Status for {}: {}".format(prj, build, status))
+    if not status:
+        if check_rex_in_folder(name, build):
+            db.insert_build(build, host, status="created", table=table_info)
+            db.update_rex_status(build=build, status="created", table=table_info)
+            return 1
+        try:
+            db.insert_build(build, host, status="creating", table=table_info)
+            if(prj == "Master"):
+                print("--- Start create Mster project ---")
+                prebase.create_master_model(build, rex_path=rex_path)
+            else:
+                print("--- Start create Mster_adv project ---")
+                prebase.create_master_model_adv(build, rex_path=rex_path)
+            db.update_rex_status(status="created", build=build, table=table_info)
+            remove_old_build(table_info)
+        except Exception as ex:
+            log.error(str(ex))
+            db.remove_build(build, table_info)
+            raise Exception("Rex project was not created in 'try' block")
+    elif status == "creating":
+        db_date = db.get_date(build, table=table_info)
+        db_date = datetime.strptime(db_date, "%m/%d/%Y %H:%M")
+        now = date_now()
+        if((now-db_date).seconds/60.0 > 20):
+            log.info("Time to create expired. Delete {} from {}".format(build, table_info))
+            db.remove_build(build, table_info)
+            log.info("--- Create again... ---")
+            prebase_rex(prj)
+        if(wait):
+            temp_list = list
+            temp_list.remove(prj)
+            print("temp_list: ", temp_list[0])
+            prj2 = temp_list[0]
+            # print("prj2: ", prj2)
+            prebase_rex(prj2, False)
+            created = wait_prebase_done(build, table_info)
+            if not created:
+                # db.remove_build(build, table_info)     ????? Maybe shoud be calls
+                log.error("Rex project {} was not created".format(prj2))
+                raise Exception("Rex project {} was not created".format(prj2))
+    else:
+        print(status)
+        return True
+
+def prebase_master(recreate=False, steps=4):
+    log.info("--- prebase_master called ---")
+    do.delete_ini_file()
+    stages = 4
+    host = socket.gethostname()
+    build = build_from_file()
+    table = "master_info"
+    name = "Master Model"
+    dlls_folder = "dll" if is_dlls_folder() else ""
+    step = 0
+    n = 1
+    if recreate:
+        db.remove_build(build, table)
+        remove_rex(name, build)
+    while(n < stages+1):
+        stage_status = db.stage(table, build, n)
+        table_host = db.host(table, build)
+        if not db.check_build(build, table):
+            db.add_build(build, table)
+        if not stage_status and not table_host:
+            db.update_host(build, table, hostname=host)
+        elif(stage_status == "created"):
+            n += 1
+        elif(stage_status == "creating"):
+            if steps == 1:
+                return
+            prebase_master_adv(steps=1)
+            log.info("||||| Status 'creating' in prebase_master for stage {} |||||".format(n))
+        else:
+            table_host = db.host(table, build)
+            if table_host == host:
+                stage = "stage" + str(n)
+                if check_rex_in_folder(name, build):
+                    print("check_rex_in_folder")
+                    db.insert_build_stage(build=build, status="created", table=table, stage=stage)
+                    db.update_stage_status(build=build, status="created", table=table, stage="stage2", hostname=host)
+                    db.update_stage_status(build=build, status="created", table=table, stage="stage3", hostname=host)
+                    db.update_stage_status(build=build, status="created", table=table, stage="stage4", hostname=host)
+                    db.clear_host(build, table)
+                    return 1
+                try:
+                    db.insert_build_stage(build=build, status="creating", table=table, stage=stage)
+                    log.info("--- Start create Master project in {} ---".format(stage))
+                    log.info("step = {}".format(n))
+                    prebase.create_master_model(stage=n, build=build, rex_path=stage_rex_path, dlls=dlls_folder)
+                    db.update_stage_status(build=build, status="created", table=table, stage=stage, hostname=host)
+                    log.info("--- Finished create project in {} ---".format(stage))
+                    db.clear_host(build, table)
+                    step += 1
+                    n += 1
+                    if step == steps:
+                        log.info("--- All {} steps done ---".format(step))
+                        remove_old_build(table)
+                        return
+                except Exception as ex:
+                    db.remove_stage_status(build=build, table=table, stage=stage)
+                    log.error(str(ex))
+                    db.clear_host(build, table)
+                    raise Exception("Rex project {} was not created".format(prj2))("Rex project was not created")
+            else:
+                # print("Not my host in Master")
+                if steps == 1:
+                    return
+        time.sleep(2)
+
+
+def prebase_master_adv(recreate=False, steps=6):
+    log.info("--- prebase_master_adv called ---")
+    do.delete_ini_file()
+    stages = 6
+    host = socket.gethostname()
+    build = build_from_file()
+    table = "master_adv_info"
+    name = "Master Model_adv"
+    dlls_folder = "dll" if is_dlls_folder() else ""
+    step = 0
+    n = 1
+    if recreate:
+        log.info("--- RECREATE called ---")
+        db.remove_build(build, table)
+        remove_rex(name, build)
+    while(n < stages+1):
+        stage_status = db.stage(table, build, n)
+        table_host = db.host(table, build)
+        if not db.check_build(build, table):
+            db.add_build(build, table)
+        if not stage_status and not table_host:
+            db.update_host(build, table, hostname=host)
+        elif(stage_status == "created"):
+            print("Status '{}' in prebase_master_adv for stage {} |||||".format(stage_status, n))
+            n += 1
+        elif(stage_status == "creating"):
+            if steps == 1:
+                return
+            prebase_master(steps=1)
+            log.info("||||| Status 'creating' in prebase_master_adv for stage {} |||||".format(n))
+        else:
+            table_host = db.host(table, build)
+            if table_host == host:
+                stage = "stage" + str(n)
+                if check_rex_in_folder(name, build):
+                    print("check_rex_in_folder in Master_adv")
+                    db.insert_build_stage(build=build,  status="created", table=table, stage=stage)
+                    db.update_stage_status(build=build, status="created", table=table, stage="stage2", hostname=host)
+                    db.update_stage_status(build=build, status="created", table=table, stage="stage3", hostname=host)
+                    db.update_stage_status(build=build, status="created", table=table, stage="stage4", hostname=host)
+                    db.update_stage_status(build=build, status="created", table=table, stage="stage5", hostname=host)
+                    db.update_stage_status(build=build, status="created", table=table, stage="stage6", hostname=host)
+                    db.clear_host(build, table)
+                    return 1
+                try:
+                    db.insert_build_stage(build=build, status="creating", table=table, stage=stage)
+                    log.info("--- Start create Master_adv project in {} ---".format(stage))
+                    log.info("step = {}".format(n))
+                    prebase.create_master_model_adv(stage=n, build=build, rex_path=stage_rex_path, dlls=dlls_folder)
+                    db.update_stage_status(build=build, status="created", table=table, stage=stage, hostname=host)
+                    log.info("--- Finished create Master_adv project in {} ---".format(stage))
+                    db.clear_host(build, table)
+                    step += 1
+                    n += 1
+                    if step == steps:
+                        log.info("--- All {} steps done ---".format(step))
+                        remove_old_build(table)
+                        return
+                except Exception as ex:
+                    db.remove_stage_status(build=build, table=table, stage=stage)
+                    log.error(str(ex))
+                    db.clear_host(build, table)
+                    raise Exception("Rex project was not created")
+            else:
+                # print("No my host in Master_adv")
+                if steps == 1:
+                    return
+        time.sleep(2)
+
+def remove_old_build(table):
+    n = 5
+    files = [filename for filename in os.listdir(path = rex_path)]
+    name = "Master Model_adv" if len(table.split("_")) == 2 else "Master Model"
+    print(name)
+    data = db.get_all_builds(table)
+    print(data)
+    list = []
+    for d in data:
+        list.append(d[0])
+    newList = sorted(list)
+    print(newList)
+    for i in range(len(newList)-n):
+        elem = newList[0]
+        db.remove_build(newList.pop(0), table)
+        for file in files:
+            if (file.find(name + "-" + elem)!=-1):
+                os.remove(os.path.join(rex_path, file))
+                log.info(file, "has been deleted")
+
+def remove_rex(name, build):
+    files = [filename for filename in os.listdir(path = rex_path)]
+    for file in files:
+        if (file.find(name + "-" + str(build)) != -1):
+            os.remove(os.path.join(rex_path, file))
+            log.info(file, "has been deleted")
+
+def check_rex_in_folder(name, build):
+    dlls_folder = "dll" if is_dlls_folder() else ""
+    files = [filename for filename in os.listdir(path = os.path.join(rex_path, dlls_folder))]
+    for file in files:
+        if (file.find(name + "-" + str(build)+".rex")!=-1):
+            return True
+    return False
+
+def last_rex(name="Master Model"):
+    n = 1 if len(name.split("_")) == 2 else 2
+    dlls_folder = "dll" if is_dlls_folder() else ""
+    if(name == "Master Model"):
+        pattern = ["(\w{6} \w{5}-\d{4}.rex)", "(\w{6} \w{5}-\d{4}.ced)"]
+    else:
+        pattern = ["(\w{6} \w{5}_adv-\d{4}.rex)"]
+    files = [filename for filename in os.listdir(path = os.path.join(rex_path, dlls_folder))]
+    rex_list = []
+    ced_list = []
+    for file in files:
+        match1 = re.search(pattern[0], file)
+        if match1:
+            rex_list.append(file)
+        if n == 2:
+            match2 = re.search(pattern[1], file)
+            if match2:
+                ced_list.append(file)
+    rex_list = sorted(rex_list)
+    ced_list = sorted(ced_list)
+    # print("rex_list: ", rex_list)
+    # print("ced_list: ", ced_list)
+    if ced_list:
+        return [ced_list[-1], rex_list[-1]]
+    return rex_list[-n:]
+
+def remove_srs(path=rex_path):
+    files = [filename for filename in os.listdir(path = rex_path)]
+    for file in files:
+        if os.path.splitext(file)[1] == ".srs":
+            os.remove(os.path.join(rex_path, file))
+            print("File '{}' has been deleted".format(os.path.join(rex_path, file)))
+
+def init_copy(prj, script, type, self_path, local=False):
+    remove_srs()
+    print(sys._getframe().f_code.co_name)
+    src_path = rex_copy_base if type == "base" else rex_copy_manager
+    dlls_folder = "dll" if is_dlls_folder() else ""
+    ext = [".rex", ".ced"]
+    n = script.split("_")[1]
+    name = prj + "_" + n
+    xml = prj + "_" + n + ".xml"
+    rt = self_path.split("\\")[-3:]
+    rex_path_new = os.path.join(rex_path, dlls_folder)
+    for p in rt:
+        src_path = os.path.join(src_path, p)
+    src_prj = last_rex(name=prj)
+    src_prj.reverse()
+    dst = os.path.join(src_path, name + ext[0])
+    xml_dst = os.path.join(src_path, xml)
+    n = 1 if len(prj.split("_")) == 2 else 2
+    os.makedirs(src_path, exist_ok=True)
+    try:
+        os.remove(xml_dst)
+        log.info("File '{}' has been deleted".format(xml_dst))
+    except FileNotFoundError:
+        pass
+    for i in range(n):
+        try:
+            os.remove(os.path.join(src_path, name + ext[i]))
+            log.info("File '{}' has been deleted".format(os.path.join(src_path, name + ext[i])))
+        except FileNotFoundError:
+            pass
+    for i in range(n):
+            copyfile(src=os.path.join(rex_path_new, src_prj[i]), dst=os.path.join(src_path, name + ext[i]))
+            log.info("File '{}' has been copied to '{}'".format(os.path.join(rex_path_new, src_prj[i]), os.path.join(src_path, name + ext[i])))
+    change.audit_log_file(project=dst, xml=xml_dst, local=local)
+    return dst
+
+def get_project_path(prj, script, self_path):
+    src_path = rex_copy_manager
+    ext = [".rex", ".ced"]
+    n = script.split("_")[1]
+    name = prj + "_" + n
+    rt = self_path.split("\\")[-3:]
+    for p in rt:
+        src_path = os.path.join(src_path, p)
+    src_prj = last_rex(name=prj)
+    src_prj.reverse()
+    dst = os.path.join(src_path, name + ext[0])
+    if(os.path.exists(dst)):
+        return dst
+    else:
+        raise Exception("--- {} not exist ---".format(dst))
+
+def remove_old_ports(table="ports"):
+    query = "SELECT date FROM {} WHERE port=?".format(table)
+    now = date_now()
+    ports = db.get_ports()
+    # print(ports)
+    if ports:
+        for port in ports:
+            try:
+                values = (port)
+                date = db.run_sql(query, values)
+                db_date = datetime.strptime(date, "%m/%d/%Y %H:%M:%S")
+                # print("diff: ", ((now - db_date).days))
+                if((now - db_date).days >= 1):
+                    db.remove_port(port)
+            except:
+                log.info("Cannot remove port:{} from table".format(port))
+
+def give_port():
+    remove_old_ports()
+    last_port = int(db.last_port())
+    port = 9000 if (not last_port or last_port == 9999) else last_port + 1
+    # db.insert_port(port)
+    return port
+
+def server_by_port(port):
+    init_list()
+    for server in servers:
+        sql = "SELECT server_name FROM {} WHERE port=?".format(server)
+        values = (port)
+        server = db.run_sql(sql, values)
+        if server:
+            print("server by port: ", server)
+            return server
