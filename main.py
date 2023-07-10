@@ -35,7 +35,9 @@ from log_to_txt import save_log
 MINIMUM_AGENT_VERSION = "0.5"
 URL = "http://bugtrack/rest/"
 client1_path = r"\\ryzen02-server\MUA\CLIENT_1"
-
+build_tasks = {}
+rerun_tasks = {}
+build_status = {}
 ## WEB SERVER UTILS
 
 async def serve_static_file(request, document_root, path):
@@ -780,6 +782,36 @@ def af_list_contacts_all(connection, msg):
         } for row in db.iter_contact_assignments()
     ])
 
+@apifunc("list/statistics-builds/all")
+def af_list_statistic_builds_all(connection, msg):
+    respond(connection, msg, [{
+            "id": row["id"],
+            "build": row["build"]
+        } for row in db.all_builds()
+    ])
+
+@apifunc("statistics/all")
+def af_list_statistic_builds_all(connection, msg):
+    respond(connection, msg, [{
+            "id": row["id"],
+            "build": row["build"],
+            "date": row["date"],
+            "total": row["total"],
+            "pminaiev": row["pminaiev"],
+            "adymnich": row["adymnich"],
+            "osemencha": row["osemencha"],
+            "asmola": row["asmola"],
+            "yhelenko": row["yhelenko"],
+            "ayakunina": row["ayakunina"],
+            "svoronina": row["svoronina"],
+            "dteterin": row["dteterin"],
+            "ryurkov": row["ryurkov"],
+            "amykhailencko": row["amykhailencko"],
+            "aaksionov": row["aaksionov"],
+            "yyakunin": row["yyakunin"],
+            "okozhushkina": row["okozhushkina"]
+        } for row in db.get_statistics()
+    ])
 ## PART 5: MISC
 
 @apifunc("update/build-list")
@@ -831,7 +863,12 @@ def af_launch_test(connection, msg):
 
     if build is not None and tsuite is not None and mgroup is not None:
         EVENT_LOOP.create_task(
-                run_one_result(build, mgroup, tsuite, test_groups, contact))
+                run_one_result(build, mgroup, tsuite, contact, test_groups))
+        ## Debug code
+        # task = asyncio.Task(run_one_result(build, mgroup, tsuite, contact=contact, test_groups=test_groups))
+        # build_tasks[build_id] = [task, mgroup, tsuite]
+        # rerun_tasks[build_id] = []
+
 
 @apifunc("stop/result")
 def af_stop_result(connection, msg):
@@ -841,6 +878,12 @@ def af_stop_result(connection, msg):
         respond(connection, msg, True)
     else:
         respond(connection, msg, False)
+    try:
+        del build_tasks[rowid]
+        del build_status[rowid]
+    except Exception as e:
+        build_name = db.build_name_by_id(rowid)["name"]
+        save_log(message=f"Exception in @apifunc('stop/result'): {e}", suffix=build_name)
 
 ## ASYNC JOBS
 
@@ -901,7 +944,7 @@ async def periodic(seconds, job):
             future = job()
             if future is not None: await future
         except Exception as e:
-            print("PERIODIC JOB FAILED:", e)
+            print("PERIODIC JOB FAILED:", e, "job=", job)
         await asyncio.sleep(random.randrange(minsleep, maxsleep))
 
 def register_a_build(product, path, mtime):
@@ -939,6 +982,7 @@ def register_a_build(product, path, mtime):
         })
         save_log(message=f"Line 943: launch_all_the_tests. {name}, {path}, {mtime} with row[id]={row['id']}", suffix=name)
         launch_all_the_tests(row["id"])
+
 
 def job_create_build(path, product):
     def work(path, product):
@@ -1084,7 +1128,7 @@ class JobCenter:
 
 ## TESTING, PART II: THE WORKERS
 
-def launch_all_the_tests(build_id, contact="Main Log"):
+def launch_all_the_tests(build_id, contact="Main Log", red=False):
     print("1: ", contact)
     build = db.get_build(build_id)
     if build is None:
@@ -1096,9 +1140,84 @@ def launch_all_the_tests(build_id, contact="Main Log"):
         ts = db.get_test_suite(ts_id)
         mg = db.get_machine_group(mg_id)
         if ts is not None and mg is not None:
-            EVENT_LOOP.create_task(run_one_result(build, mg, ts, contact=contact))
+            # EVENT_LOOP.create_task(run_one_result(build, mg, ts, contact=contact))
+            # EVENT_LOOP.create_task(run_one_result(build, mg, ts, contact))
+            task = asyncio.Task(run_one_result(build, mg, ts, contact=contact))
+            build_tasks[build_id] = [task, mg, ts]
+            rerun_tasks[build_id] = []
 
-async def run_one_result(build, mg, ts, test_groups=None, contact="Main Log"):
+def check_build_tasks():
+    """build_tasks[build_id] = [task, mg, ts] and then build_tasks[build_id] = [task, mg, ts, result_id]"""
+    print("check_build_tasks called")
+    for build_id in build_tasks.copy().keys():
+        print("build_tasks: ", build_tasks)
+        try:
+            task = build_tasks[build_id][0]
+        except:
+            print("error in task = build_tasks[build_id][0]")
+            save_log(message=f"error in task = build_tasks[build_id][0]", add_folder="reruns", suffix=build_id)
+        if task.done():
+            print("task done for build_id = ", build_id)
+            max_len = 10
+            build = db.get_build(build_id)
+            save_log(message=f"task done for build_id={build_id}", add_folder="reruns", suffix=build['name'])
+            mg = build_tasks[build_id][1]
+            ts = build_tasks[build_id][2]
+            result_id = build_tasks[build_id][3]
+            res = db.result_by_id(result_id)
+            db_dict = {}
+            for item in res:
+                contact = item['test_name'].split('.')[1]
+                if contact not in db_dict:
+                        db_dict[contact] = []
+                if(item['test_passed'] == 0):
+                    db_dict[contact].append(item['test_name'])
+            to_rerun = {}
+            for key, value in db_dict.items():
+                if len(value) > max_len:
+                    sub_lists = [value[i:i+max_len] for i in range(0, len(value), max_len)]
+                    to_rerun[key] = sub_lists
+                else:
+                    if len(value) != 0:
+                        to_rerun[key] = [value]
+            save_log(message=str(to_rerun), add_folder="reruns", suffix=build['name'])
+            try:
+                for key, value in to_rerun.items():
+                    for test_group in value:
+                        # EVENT_LOOP.create_task(run_one_result(build, mg, ts, contact=key, test_groups=[test_group]))
+                        task = asyncio.Task(run_one_result(build, mg, ts, contact=key, test_groups=[test_group]))
+                        rerun_tasks[build_id].append(task)
+                save_log(message="All rerun_tasks created", suffix=build['name'])
+                del build_tasks[build_id]
+                build_status[build_id] = True
+            except Exception as ex:
+                save_log(message=f"No rerurans. Exception in 1192: {str(ex)}", suffix=build['name'])
+                del build_tasks[build_id]
+
+def check_rerun_tasks():
+    print("check_rerun_tasks called")
+    print("rerun_tasks: ", rerun_tasks)
+    for build_id, tasks in rerun_tasks.copy().items():
+        print("build_status: ", build_status.get(build_id, False))
+        print(f"build_id: {build_id}, tasks: {tasks}")
+        if build_status.get(build_id, False):
+            completed_tasks = [task for task in tasks if task.done()]
+            if len(completed_tasks) == len(tasks):
+                # All rerun tasks completed, call the insert_statistics function
+                dates = db.log_date(build_id)
+                if dates:
+                    main_log_date = db.log_date(build_id)[-1]
+                    main_log_id = main_log_date["id"]
+                statistics = db.tester_statistics(main_log_id)
+                build = db.build_by_result_id(main_log_id)
+                if build:
+                    insert_statistics(statistics, build)
+                    save_log(message="Statistics has been added", suffix=build)
+                del rerun_tasks[build_id]  # Removing completed rerun tasks from the dictionary
+                del build_status[build_id]
+                save_log(message=f"rerun_tasks and build_status removed", suffix=build)
+
+async def run_one_result(build, mg, ts, contact, test_groups=None):
     def update_result_status(result_id, status, send=True):
         if result_id in RESULT_TASK_MAP:
             RESULT_STATUS_MAP[result_id] = status
@@ -1111,6 +1230,11 @@ async def run_one_result(build, mg, ts, test_groups=None, contact="Main Log"):
     with db.DB:
         result_id = db.create_result(
                 build["id"], ts["id"], mg["id"], start_date, contact)
+    if build["id"] in build_tasks:
+        print("build_id in build_tasks")
+        build_tasks[build["id"]].append(result_id)
+        print("new build_tasks: ", build_tasks)
+        save_log(message=f"append result_id={result_id}", add_folder="reruns", suffix=build['name'])
     result_log_path = None
     ts_spec = json.loads(ts["spec"])
     RESULT_TASK_MAP[result_id] = asyncio.Task.current_task(loop=EVENT_LOOP)
@@ -1141,10 +1265,12 @@ async def run_one_result(build, mg, ts, test_groups=None, contact="Main Log"):
                 "build_path": build["path"],
                 "test_suite_spec": ts_spec
             })
+            save_log(tests_list, suffix="tests_list")
             test_groups = []
             for script, units in tests_list.items():
+                save_log(f"{script} {units}", suffix="script+units")
                 test_groups.append([script + "." + unit for unit in units])
-                print("script: ", script, "units: ", units)
+        save_log(test_groups, suffix="test_groups")
         random.shuffle(test_groups)
         update_result_status(result_id,
                 "dispatching (%d groups in total)" % len(test_groups))
@@ -1244,7 +1370,7 @@ async def run_one_result(build, mg, ts, test_groups=None, contact="Main Log"):
         try:
             recolor_scripts(result_id)
         except Exception as e:
-            save_log(str(e), result_id)
+            save_log(str(e), add_folder='RE errors', suffix=str(result_id))
         messageall({
             "m": "update", "table": "results",
             "value": {
@@ -1424,38 +1550,67 @@ def remove_temp_txt(log_path = r"\\DOMAIN16\MUA\temp_vp"):
 
 def recolor_scripts(result_id):
     main_build_id = db.main_build_id(result_id)["build_id"]
-    # print(main_build_id)
     build_name = db.build_name_by_id(main_build_id)["name"]
-    main_log_data = db.get_main_log_date(main_build_id)[-1]
-    main_log_id = main_log_data["id"]
-    print(main_build_id, build_name, main_log_id)
-    # print("main start date: ", datetime.datetime.fromtimestamp(main_start_date))
-    # print("main log id: ", main_log_id)
-
+    dates = db.log_date(main_build_id)
+    if dates:
+        main_log_date = db.log_date(main_build_id)[-1]
+        main_log_id = main_log_date["id"]
+    else:
+        return
     main_scripts = db.result_by_id(main_log_id)
     count = 0
     colored_scripts = []
-
+    contact = db.contact_by_result_id(result_id)["contact"]
     rerun_scripts = db.result_by_id(result_id)
     for item1 in rerun_scripts:
         for item2 in main_scripts:
-            if item1["test_name"] == item2["test_name"] :
-                if item1["test_passed"] > item2["test_passed"] :
-                    # item2["test_passed"] = item1["test_passed"]
-                    # print(item1["test_name"], "   ", item1["test_passed"])
-                    # print(item2["test_name"], "   ", item2["test_passed"])
+            if item1["test_name"] == item2["test_name"]:
+                if item1["test_passed"] > item2["test_passed"]:
                     db.update_item_by_result_id(main_log_id, item1["test_name"], item1["test_passed"])
                     colored_scripts.append((f"{main_log_id} from {result_id}", item1["test_name"]))
                     count += 1
-    # print(f"Recolored {count} scripts: \n_______________________________")
-    # for script in colored_scripts:
-    #     print(script)
     if(colored_scripts):
         save_log(f"Recolored {count} scripts: \n____________________________________", build_name)
         for script in colored_scripts:
             save_log(script, build_name)
+    if len(rerun_scripts) == count:
+        db.delete_result(result_id)
+        save_log(f"Result {result_id} from {contact} was removed because all scripts passed. \n____________________________________", build_name)
 
+def remove_db_log():
+    logs = db.all_not_main_logs()
+    now = datetime.datetime.now()
+    count = 0
+    for log in logs:
+        try:
+            if(log['end_date']):
+                formatted_date = datetime.datetime.fromtimestamp(log['end_date'])
+                days = (now - formatted_date).days
+                if (days > 7 ):
+                    count += 1
+                    db.delete_result(log['id'])
+                    save_log(message=f"Log created at {formatted_date} by {log['contact']} {days} days ago, id={log['id']}", add_folder="Removed logs")
+        except Exception as ex:
+            save_log(message=f"Error: {ex}", add_folder="Removed logs", suffix="error")
+    print(f"Removed {count} logs")
+    save_log(message=f"Removed {count} logs", add_folder="Removed logs")
 
+def insert_statistics(statistics, build):
+    if (build.find("mua")!=-1):
+        return False
+    total_scripts, data = statistics
+    print(f"All scripts={total_scripts}")
+    if(total_scripts > 0):
+        testers = db.testers()
+        date = datetime.datetime.now().strftime("%m/%d/%Y %H:%M")
+        db.add_build_to_statistics(build, date, total_scripts)
+        for tester in testers:
+            print(tester, str(data[tester]))
+            db.update_statistics(tester, str(data[tester]), build)
+        print("Statistics has been added to db")
+        return True
+    else:
+        return False
 ## GLOBALS
 
 CLIENTS = []
@@ -1484,4 +1639,15 @@ if __name__ == "__main__":
     EVENT_LOOP.create_task(periodic(1*20, bot.main))
     EVENT_LOOP.create_task(periodic(20*60, sending_testing_results))
     EVENT_LOOP.create_task(periodic(24*60*60, remove_old_logs))
+    EVENT_LOOP.create_task(periodic(24*60*60, remove_db_log))
+    EVENT_LOOP.create_task(periodic(3*60, check_build_tasks))
+    EVENT_LOOP.create_task(periodic(3*60, check_rerun_tasks))
     EVENT_LOOP.run_forever()
+
+
+    #result_id = 29835
+    #statistics = db.tester_statistics(result_id)
+    # print(statistics)
+    #build = db.build_by_result_id(result_id)
+    #print(build)
+    #send_mes = db2.insert_statistics(statistics, build)
